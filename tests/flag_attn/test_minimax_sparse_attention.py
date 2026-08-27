@@ -33,7 +33,7 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode,
 )
 
-index_topk_module = importlib.import_module("flag_attn.minimax_sparse_attention.index_topk")
+index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
@@ -59,6 +59,18 @@ def _supports_fp8() -> bool:
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="MSA v1 tests require CUDA"
 )
+
+
+def test_public_exports_use_active_backend() -> None:
+    from flag_attn.runtime.backend import is_metax_backend
+
+    module_name = minimax_m3_sparse_attn.__module__
+    if is_metax_backend():
+        assert module_name.startswith(
+            "flag_attn.runtime.backend._metax.minimax_sparse_attention"
+        )
+    else:
+        assert module_name.startswith("flag_attn.minimax_sparse_attention")
 
 
 @dataclass

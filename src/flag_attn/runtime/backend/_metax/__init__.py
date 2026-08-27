@@ -11,3 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from .minimax_sparse_attention import (
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_index_decode,
+    minimax_m3_index_decode_score,
+    minimax_m3_index_score,
+    minimax_m3_index_topk,
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
+
+__all__ = [
+    "SPARSE_BLOCK_SIZE",
+    "minimax_m3_index_decode",
+    "minimax_m3_index_decode_score",
+    "minimax_m3_index_score",
+    "minimax_m3_index_topk",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
+]
