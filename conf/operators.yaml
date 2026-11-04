@@ -475,4 +475,6 @@ ops:
       - tests/flag_attn/test_infllmv2_attention.py::test_invalid_attention_input_is_rejected
       - tests/flag_attn/test_infllmv2_attention.py::test_decode_varlen_matches_reference
       - tests/flag_attn/test_infllmv2_attention.py::test_invalid_decode_batch_is_rejected
+      - tests/flag_attn/test_infllmv2_c550.py
+      - tests/flag_attn/test_infllmv2_c550_generalization.py
     benchmark: benchmark/test_infllmv2_attention_benchmark.py

@@ -17,6 +17,10 @@ import torch
 import triton
 import triton.language as tl
 
+def _is_metax():
+    return triton.runtime.driver.active.get_current_target().backend in ("maca", "metax")
+
+
 try:
     import triton.experimental.tle.language as tle
     from triton.tools.tensor_descriptor import TensorDescriptor
@@ -154,12 +158,22 @@ def _stage1_kernel(
     block_g: tl.constexpr,
     block_d: tl.constexpr,
     block_n: tl.constexpr,
+    selection_topk: tl.constexpr = 0,
+    selection_block_size: tl.constexpr = 64,
+    selection_local_blocks: tl.constexpr = 0,
 ):
     q_local_start = tl.program_id(0) * block_q
     hk = tl.program_id(1)
     batch = tl.program_id(2)
     q_start = tl.load(cu_q_ptr + batch)
     q_end = tl.load(cu_q_ptr + batch + 1)
+    if causal and selection_topk > 0:
+        # Internal selector never reads scores while all causal blocks fit
+        # in TopK. Shift by whole query tiles to keep the same score math and
+        # leave those unused rows unwritten. Public stage1 keeps every row.
+        kv_len = tl.load(cu_k_ptr + batch + 1) - tl.load(cu_k_ptr + batch)
+        unused = tl.maximum(0, selection_topk * selection_block_size - (kv_len - (q_end - q_start)))
+        q_local_start += unused // block_q * block_q
     if q_start + q_local_start >= q_end:
         return
     k1_start = tl.load(cu_k1_ptr + batch)
@@ -199,7 +213,10 @@ def _stage1_kernel(
     coarse_q_len = tl.maximum(0, q_len - coarse_stride + 1) // coarse_stride
     coarse_right = tl.maximum(0, (q_local + 1) // coarse_stride - 1 + k2_len - coarse_q_len)
     offs_n = tl.arange(0, block_n)
-    for start_n in tl.range(0, k2_len, block_n):
+    coarse_end = k2_len
+    if causal and selection_topk > 0:
+        coarse_end = tl.minimum(k2_len, tl.max(coarse_right, 0))
+    for start_n in tl.range(0, coarse_end, block_n):
         pos = start_n + offs_n
         k_ptrs = k2_ptr + (k2_start + pos[None, :]) * hkv * d + hk * d + offs_d[:, None]
         kval = tl.load(k_ptrs, mask=(offs_d[:, None] < d) & (pos[None, :] < k2_len), other=0.0)
@@ -226,7 +243,15 @@ def _stage1_kernel(
 
     fine_q_len = tl.maximum(0, q_len - k1_stride + 1) // k1_stride
     fine_right = tl.maximum(0, (q_local + 1) // k1_stride - 1 + k1_len - fine_q_len)
-    for start_n in tl.range(0, k1_len, block_n):
+    fine_end = k1_len
+    if causal and selection_topk > 0:
+        # Pooling never loads scores of forced local blocks. Its largest
+        # fine index for block b is (b+1)*(BS/k1_stride)-1. Therefore only
+        # blocks before the local window need score computation/storage.
+        position = kv_len - q_len + tl.minimum(q_local_start + block_q, q_len) - 1
+        first_local = position // selection_block_size - selection_local_blocks
+        fine_end = tl.minimum(k1_len, tl.maximum(0, first_local * (selection_block_size // k1_stride)))
+    for start_n in tl.range(0, fine_end, block_n):
         pos = start_n + offs_n
         k_ptrs = k1_ptr + (k1_start + pos[None, :]) * hkv * d + hk * d + offs_d[:, None]
         kval = tl.load(k_ptrs, mask=(offs_d[:, None] < d) & (pos[None, :] < k1_len), other=0.0)
@@ -260,6 +285,10 @@ def stage1(
     cu_seqlens_k: torch.Tensor | None = None,
     *,
     _allow_tle: bool = True,
+    _max_k1: int | None = None,
+    _selection_topk: int = 0,
+    _selection_block_size: int = 64,
+    _selection_local_blocks: int = 0,
 ) -> torch.Tensor:
     cu_seqlens_k = cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
     _check_cuda_contiguous(q, k1, k2, cu_seqlens_q, cu_seqlens_k1, cu_seqlens_k2, cu_seqlens_k)
@@ -268,11 +297,11 @@ def stage1(
     if hq % hkv:
         raise ValueError("number of query heads must be divisible by KV heads")
     group = hq // hkv
-    max_k1 = int(torch.max(cu_seqlens_k1[1:] - cu_seqlens_k1[:-1]).item())
+    max_k1 = int(torch.max(cu_seqlens_k1[1:] - cu_seqlens_k1[:-1]).item()) if _max_k1 is None else _max_k1
     # On Hopper, a double-buffered TMA/WGMMA implementation begins to amortize
     # its TensorMap/shared-memory setup at 65K full-prefill. Shorter prefill and
     # decode retain the lower-overhead standard Triton tl.dot kernel.
-    use_tle_hopper = _allow_tle and _TLE_AVAILABLE and (
+    use_tle_hopper = _allow_tle and _TLE_AVAILABLE and not _is_metax() and (
         max_seqlen_q >= 65536
         and q.dtype == torch.bfloat16
         and k1.dtype == q.dtype
@@ -299,7 +328,9 @@ def stage1(
     # Stage1 probabilities are already rounded to the Q dtype in the kernel.
     # Storing them as FP32 only doubles traffic and capacity without retaining
     # additional information.
-    out = torch.zeros((hkv, total_q, max_k1), dtype=q.dtype, device=q.device)
+    # Internal MACA pooling masks the padded columns using device lengths.
+    allocate = torch.zeros if _max_k1 is None else torch.empty
+    out = allocate((hkv, total_q, max_k1), dtype=q.dtype, device=q.device)
     if max_k1 == 0:
         return out
     scale = softmax_scale if softmax_scale is not None else d**-0.5
@@ -308,9 +339,12 @@ def stage1(
     # autotuner picks it.  Autotune only the long-prefill regime where K reuse
     # amortizes the smaller grid.
     tune_key = triton.next_power_of_2(max_seqlen_q)
-    if max_seqlen_q < 1024:
-        block_q = 1
-        _stage1_kernel.fn[(max_seqlen_q, hkv, cu_seqlens_q.numel() - 1)](
+    # C550 has 64 KiB of shared memory and 64-thread warps. The CUDA
+    # D128 N128/stages2 tile needs 69,888 bytes on MACA.
+    metax = _is_metax()
+    if max_seqlen_q < 1024 or metax:
+        block_q = 4 if metax and max_seqlen_q >= 1024 and group == 16 and d in (64, 128) else 1
+        _stage1_kernel.fn[(triton.cdiv(max_seqlen_q, block_q), hkv, cu_seqlens_q.numel() - 1)](
             q,
             k1,
             k2,
@@ -333,9 +367,12 @@ def stage1(
             block_q=block_q,
             block_g=max(16, triton.next_power_of_2(group)),
             block_d=triton.next_power_of_2(d),
-            block_n=128,
+            block_n=64 if metax else 128,
+            selection_topk=_selection_topk if metax else 0,
+            selection_block_size=_selection_block_size,
+            selection_local_blocks=_selection_local_blocks,
             num_warps=4,
-            num_stages=2,
+            num_stages=1 if metax else 2,
         )
         return out
     def grid(meta):
@@ -554,13 +591,15 @@ def _select_blocks_streaming_kernel(
     index_key = _topk_index_to_key(block_idx)
     packed = (score_key.to(tl.uint64) << 16) | index_key.to(tl.uint64)
     packed = tl.where(valid, packed, tl.zeros_like(packed))
-    selected_keys = tl.topk(packed, topk)
+    # MACA sort_impl cannot reshape the scalar reduction produced by k=1.
+    selected_keys = tl.max(packed, axis=0, keep_dims=True) if topk == 1 else tl.topk(packed, topk)
 
     # Merge one sorted TopK list per score tile.  Packing score in the high
     # bits and the reversed block id in the low bits gives deterministic,
     # stable ties: equal scores prefer the smaller logical block id.
     for _ in tl.range(0, num_tiles - 1):
-        selected_keys = tl.bitonic_merge(selected_keys)
+        if topk > 1:
+            selected_keys = tl.bitonic_merge(selected_keys)
         tile_start -= block_b
         block_idx = tile_start + offs_b
         score = tl.load(score_row + block_idx).to(tl.float32)
@@ -568,12 +607,14 @@ def _select_blocks_streaming_kernel(
         score_key = _topk_float_to_ordered_key(score.to(tl.uint32, bitcast=True))
         index_key = _topk_index_to_key(block_idx)
         packed = (score_key.to(tl.uint64) << 16) | index_key.to(tl.uint64)
-        selected_keys = tl.maximum(selected_keys, tl.topk(packed, topk))
+        tile_keys = tl.max(packed, axis=0, keep_dims=True) if topk == 1 else tl.topk(packed, topk)
+        selected_keys = tl.maximum(selected_keys, tile_keys)
 
     # Rotate the 16-bit index key above the score key and sort once more so
     # Stage2 receives the same ascending block-id order as the baseline.
     selected_keys = (selected_keys << 48) | (selected_keys >> 16)
-    selected_keys = tl.sort(selected_keys, descending=True)
+    if topk > 1:
+        selected_keys = tl.sort(selected_keys, descending=True)
     selected = _topk_key_to_index((selected_keys >> 48).to(tl.uint32))
     selected = tl.where(selected < valid_blocks, selected, -1)
     tl.store(out_ptrs, selected)
@@ -594,7 +635,7 @@ def select_blocks(
     hkv, total_q, max_blocks = block_score.shape
     if max_blocks > 4096:
         raise ValueError("TopK currently supports at most 4096 KV blocks")
-    if topk > 2048 or (topk & (topk - 1)) != 0:
+    if topk <= 0 or topk > 2048 or (topk & (topk - 1)) != 0:
         raise ValueError("TopK must be a power of two no greater than 2048")
     out = torch.full((hkv, total_q, topk), -1, dtype=torch.int32, device=block_score.device)
     if max_blocks == 0:
@@ -606,7 +647,7 @@ def select_blocks(
     # Short chunks/decode and <=256-block rows stay on streaming tl.topk.  On
     # H100 the streaming bitonic tile doubles at 257 blocks; the radix path is
     # already faster from that exact boundary in the measured BF16 shape.
-    use_tle_radix = _allow_tle and _TLE_AVAILABLE and (
+    use_tle_radix = _allow_tle and _TLE_AVAILABLE and not _is_metax() and (
         max_q >= 1024
         and max_blocks > 256
         and topk <= 64
@@ -977,6 +1018,7 @@ def _sparse_attention_forward(
     softmax_scale: float | None = None,
     causal: bool = True,
     store_lse: bool = True,
+    _c550_local_blocks: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _check_cuda_contiguous(q, k, v, selected_blocks, cu_seqlens_q, cu_seqlens_k)
     total_q, hq, d = q.shape
@@ -988,6 +1030,20 @@ def _sparse_attention_forward(
             "selected_blocks must have [Hkv, total_q_tokens, topk] layout; "
             "all query heads in one GQA group share the per-token Hkv selection"
         )
+    if _is_metax():
+        # Only the pipeline selector supplies this hint: its IDs are unique.
+        # Explicit Selected inputs keep the general path, including duplicates.
+        from .c550_reuse import sparse_reuse, reuse_config
+        reuse = reuse_config(hq // hkv, d, q.dtype, block_size,
+                             selected_blocks.shape[-1], _c550_local_blocks,
+                             max_seqlen_q, total_q) if causal else None
+        if reuse is not None:
+            return sparse_reuse(q,k,v,selected_blocks,cu_seqlens_q,cu_seqlens_k,max_seqlen_q,
+                                block_size,softmax_scale,store_lse,*_c550_local_blocks,
+                                **reuse)
+        from .c550_attention import sparse_forward
+        return sparse_forward(q,k,v,selected_blocks,cu_seqlens_q,cu_seqlens_k,max_seqlen_q,
+                              block_size,softmax_scale,causal,store_lse)
     topk = selected_blocks.shape[-1]
     out = torch.empty_like(q)
     # Inference does not consume LSE. Reuse the already allocated output as an
@@ -1004,6 +1060,10 @@ def _sparse_attention_forward(
         stage2_num_stages = 3 if d == 64 else 2
     else:
         stage2_num_stages = 2 if max_seqlen_q >= 128 else 3
+    if _is_metax():
+        # Two 64-thread warps improve D64 occupancy; D128 favors four.
+        stage2_num_warps = 2 if d <= 64 and hq // hkv <= 16 else 4
+        stage2_num_stages = 1
     _sparse_attention_gqa_kernel[(max_seqlen_q, hkv, cu_seqlens_q.numel() - 1)](
         q,
         k,
@@ -1046,6 +1106,8 @@ class _SparseAttentionFunction(torch.autograd.Function):
         block_size: int,
         softmax_scale: float | None,
         causal: bool,
+        max_seqlen_k: int | None,
+        c550_local_blocks: tuple[int, int] | None,
     ) -> torch.Tensor:
         out, lse = _sparse_attention_forward(
             q,
@@ -1058,18 +1120,26 @@ class _SparseAttentionFunction(torch.autograd.Function):
             block_size,
             softmax_scale,
             causal,
+            _c550_local_blocks=c550_local_blocks,
         )
         ctx.save_for_backward(q, k, v, selected_blocks, out, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.block_size = block_size
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.max_seqlen_k = max_seqlen_k
         return out
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         q, k, v, selected, out, lse, cu_q, cu_k = ctx.saved_tensors
         dout = dout.contiguous()
+        if _is_metax():
+            from .c550_backward import sparse_backward
+            dq,dk,dv=sparse_backward(q,k,v,out,dout,lse,selected,cu_q,cu_k,
+                                     ctx.max_seqlen_q,ctx.block_size,ctx.softmax_scale,ctx.causal,
+                                     max_k=ctx.max_seqlen_k)
+            return dq,dk,dv,None,None,None,None,None,None,None,None,None
         if ctx.max_seqlen_q >= 64:
             # Keep short decode/chunks on the lower-overhead fused path below.
             # Long queries amortize reverse-index construction and benefit from
@@ -1080,7 +1150,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
                 q, k, v, out, dout, lse, selected, cu_q, cu_k,
                 ctx.max_seqlen_q, ctx.block_size, ctx.softmax_scale, ctx.causal,
             )
-            return dq, dk, dv, None, None, None, None, None, None, None
+            return dq, dk, dv, None, None, None, None, None, None, None, None, None
         total_q, hq, d = q.shape
         hkv = k.shape[1]
         scale = ctx.softmax_scale if ctx.softmax_scale is not None else d**-0.5
@@ -1114,15 +1184,15 @@ class _SparseAttentionFunction(torch.autograd.Function):
             block_m=block_m,
             block_n=ctx.block_size,
             block_d=triton.next_power_of_2(d),
-            num_warps=8,
-            num_stages=3,
+            num_warps=4 if _is_metax() else 8,
+            num_stages=1 if _is_metax() else 3,
         )
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         for source, target in ((dk_acc, dk), (dv_acc, dv)):
             n_elements = source.numel()
             _cast_fp32_kernel[(triton.cdiv(n_elements, 256),)](source, target, n_elements, block=256)
-        return dq, dk, dv, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def sparse_attention(
@@ -1138,6 +1208,8 @@ def sparse_attention(
     causal: bool = True,
     *,
     _allow_tle: bool = True,
+    _max_seqlen_k: int | None = None,
+    _c550_local_blocks: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Differentiable sparse attention over selected blocks of continuous packed K/V."""
     if not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, k, v)):
@@ -1145,7 +1217,7 @@ def sparse_attention(
         # CTA and one launch per KV head. Measurements put its crossover above
         # short chunks, so keep decode/Q=128 on the lower-overhead tl.dot path.
         hkv = k.shape[1]
-        use_tle_hopper = _allow_tle and _TLE_AVAILABLE and (
+        use_tle_hopper = _allow_tle and _TLE_AVAILABLE and not _is_metax() and (
             max_seqlen_q >= 1024
             and q.dtype == torch.bfloat16
             and k.dtype == q.dtype
@@ -1182,6 +1254,7 @@ def sparse_attention(
             softmax_scale,
             causal,
             store_lse=False,
+            _c550_local_blocks=_c550_local_blocks,
         )[0]
     return _SparseAttentionFunction.apply(
         q,
@@ -1194,6 +1267,8 @@ def sparse_attention(
         block_size,
         softmax_scale,
         causal,
+        _max_seqlen_k,
+        _c550_local_blocks,
     )
 
 

@@ -1,0 +1,48 @@
+{
+  "v0_sha256": {
+    "operator.py": "819dc5b01648344541c03e260a1958e063cda63c61be027af18c67168fc23e5d",
+    "reference.py": "03e31d3402c431e51ae2f8bdf2b5d3ef008cbfd07e6dd655dbdbe2ae946ff668",
+    "forward.py": "64cd07a7ef5ddd1048d81802b2d4aa47c0e269e67e12f8ae1e857c6f34d671ab",
+    "__init__.py": "8910f481b33371563f5efc7dfc9f9f3d27e85d2668c559aabd21b2e0895bae84",
+    "c550.py": "0db040fae60f3a788806f5d01171f99f1748fee8c2d4ec2bab82dda523c851bb",
+    "backward.py": "ea51ee2e690751bd859ad239d04348e521bc43aa7629bf2b41e7ad74ef2bb8ca"
+  },
+  "v5": {
+    "operator.py": {
+      "sha256": "40a895e3a8f424f0b38602f7cc5e138337e30470291cdaf485705ca3624c2d9f",
+      "matches_measured_v5_ast": true
+    },
+    "reference.py": {
+      "sha256": "03e31d3402c431e51ae2f8bdf2b5d3ef008cbfd07e6dd655dbdbe2ae946ff668",
+      "matches_measured_v5_ast": true
+    },
+    "forward.py": {
+      "sha256": "a6333525b48a1d8d2682ad0a99caceb44166c964fc1e3eafc25e63d52bfd51fb",
+      "matches_measured_v5_ast": true
+    },
+    "c550_attention.py": {
+      "sha256": "63f797df587c6223b9c301c1af2e03ef272a5f92902587b90d760faace1cba1f",
+      "matches_measured_v5_ast": true
+    },
+    "c550_reuse.py": {
+      "sha256": "662de85e35a69790bc3d6a5a25203c6888be9fea458b12bc0614360217bedd17",
+      "matches_measured_v5_ast": true
+    },
+    "c550_backward.py": {
+      "sha256": "76d7ae4f89513e8e46d11f922f62a01e541aee7b2f0d6b58ed43e53c93fc0e2f",
+      "matches_measured_v5_ast": true
+    },
+    "c550_pipeline.py": {
+      "sha256": "c1b2981c9538edbdadf431ed17e01d35ec0310e7400f16b851b4d04a96603f84",
+      "matches_measured_v5_ast": true
+    },
+    "c550.py": {
+      "sha256": "4cd6aa1cc3610a9ee7e2b906b3c61504c0ff2111332659cf013d423bea47c1b1",
+      "matches_measured_v5_ast": true
+    },
+    "backward.py": {
+      "sha256": "ea51ee2e690751bd859ad239d04348e521bc43aa7629bf2b41e7ad74ef2bb8ca",
+      "matches_measured_v5_ast": true
+    }
+  }
+}

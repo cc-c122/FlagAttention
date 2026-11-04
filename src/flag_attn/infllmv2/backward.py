@@ -187,6 +187,7 @@ def sparse_backward(
     Host reads for max_K/task count synchronize CUDA. Timing must include the
     whole function, not only the two attention-gradient kernel launches.
     """
+    metax = triton.runtime.driver.active.get_current_target().backend in ("maca", "metax")
     total_q, hq, d = q.shape
     hkv = k.shape[1]
     group = hq // hkv
@@ -252,7 +253,7 @@ def sparse_backward(
         M=max(16, triton.next_power_of_2(group)),
         BD=triton.next_power_of_2(d),
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if metax else 2,
     )
     if num_tasks:
         gp = triton.next_power_of_2(group)
@@ -279,11 +280,13 @@ def sparse_backward(
             MAX_BLOCKS=max_blocks,
             BS=block_size,
             BD=triton.next_power_of_2(d),
-            M=max(16, 4 * gp),
+            # MACA D128/GQA16 needs 96 KiB with four queries per tile.
+            # One query per tile keeps the KV-owned reduction within 64 KiB.
+            M=max(16, gp) if metax else max(16, 4 * gp),
             QUERY_SPLIT=query_split,
             SCALE=scale,
             CAUSAL=causal,
             num_warps=8,
-            num_stages=2,
+            num_stages=1 if metax else 2,
         )
     return dq, dk.to(k.dtype), dv.to(v.dtype)

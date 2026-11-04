@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .forward import compress_k, pool_scores, select_blocks, sparse_attention, stage1
+from .forward import _is_metax, compress_k, pool_scores, select_blocks, sparse_attention, stage1
 
 
 @dataclass(frozen=True)
@@ -101,6 +101,15 @@ def _run_sparse_pipeline(
     softmax_scale: float | None,
 ) -> torch.Tensor:
     # Top-k selection is discrete. Gradients flow through Stage-2 Q/K/V only.
+    if _is_metax():
+        from .c550_pipeline import select
+        with torch.no_grad():
+            selected = select(q,k,cu_seqlens_q,cu_seqlens_k,max_seqlen_q,max_seqlen_k,
+                              config,softmax_scale)
+        return sparse_attention(q,k,v,selected,cu_seqlens_q,cu_seqlens_k,max_seqlen_q,
+                                config.block_size,softmax_scale,config.causal,
+                                _max_seqlen_k=max_seqlen_k,
+                                _c550_local_blocks=(config.init_blocks,config.local_blocks))
     with torch.no_grad():
         k1, cu_k1 = compress_k(k, cu_seqlens_k, config.k1_kernel_size, config.k1_stride)
         k2, cu_k2 = compress_k(k, cu_seqlens_k, config.k2_kernel_size, config.k2_stride)
@@ -137,6 +146,9 @@ def _dispatch(
     # Batch-wide decision from the LONGEST per-sequence KV, never sum(KV).
     # Match the model's strict boundary: KV < dense_len is dense; equality sparse.
     if max_seqlen_k < config.dense_len:
+        if _is_metax():
+            from .c550 import dense_attention
+            return dense_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, softmax_scale, max_seqlen_k)
         return _dense_packed(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale)
     return _run_sparse_pipeline(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
