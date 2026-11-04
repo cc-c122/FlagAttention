@@ -398,6 +398,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_forgetting_attention.py
+      - tests/flag_attn/test_parallel_forgetting_attn_metax.py
     benchmark: benchmark/test_forgetting_attention_benchmark.py
   - id: parallel_parallax
     description: Run Parallax fixed-length and variable-length prefill, backward, and KV-cache decode.
