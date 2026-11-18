@@ -75,7 +75,6 @@ def _fa4_rel_attn_paged_kernel(
     LOCAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
-    ALLOW_DIRECT_OUTPUT: tl.constexpr = False,
     SINGLE_QUERY: tl.constexpr = False,
 ):
     # The regular 3D grid directly encodes (Q block, sequence/head, split).
@@ -149,7 +148,7 @@ def _fa4_rel_attn_paged_kernel(
     q_global = q_start + q_local
     q_pos = q_local + k_len - q_len
 
-    if SPLIT_KV and ALLOW_DIRECT_OUTPUT:
+    if SPLIT_KV:
         if k_len <= BLOCK_K and split_idx > 0:
             return
 
@@ -185,11 +184,11 @@ def _fa4_rel_attn_paged_kernel(
     valid_block_end = (valid_k_end + BLOCK_K - 1) // BLOCK_K
 
     num_k_blocks = (k_len + BLOCK_K - 1) // BLOCK_K
-    blocks_per_split = (num_k_blocks + NUM_SPLITS - 1) // NUM_SPLITS
-    split_block_start = split_idx * blocks_per_split
-    split_block_end = tl.minimum(split_block_start + blocks_per_split, num_k_blocks)
-    block_start = tl.maximum(split_block_start, valid_block_start)
-    block_end = tl.minimum(split_block_end, valid_block_end)
+    valid_blocks = tl.maximum(valid_block_end - valid_block_start, 0)
+    blocks_per_split = valid_blocks // NUM_SPLITS
+    extra_blocks = valid_blocks % NUM_SPLITS
+    block_start = valid_block_start + split_idx * blocks_per_split + tl.minimum(split_idx, extra_blocks)
+    block_end = block_start + blocks_per_split + (split_idx < extra_blocks).to(tl.int32)
     for block_k in range(block_start, block_end):
         k_local = block_k * BLOCK_K + off_k
         k_valid = k_local < k_len
@@ -277,10 +276,7 @@ def _fa4_rel_attn_paged_kernel(
             other=0.0,
         )
         acc = tl.dot(probabilities.to(v_value.dtype), v_value, acc)
-        if SINGLE_QUERY and NUM_SPLITS >= 16 and (BLOCK_D_Q != 256 or BLOCK_D_V != 512):
-            m_i = m_new
-        else:
-            m_i = tl.where(row_has_value, m_new, m_i)
+        m_i = m_new
 
     if SPLIT_KV:
         partial_ptrs = (
@@ -291,11 +287,8 @@ def _fa4_rel_attn_paged_kernel(
             + off_d_v[None, :] * stride_partial_d
         )
         stats_ptrs = split_idx * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
-        stored_max = m_i
-        stored_sum = l_i
-        if ALLOW_DIRECT_OUTPUT:
-            stored_max = tl.where(k_len <= BLOCK_K, l_i, m_i)
-            stored_sum = tl.where(k_len <= BLOCK_K, -1.0, l_i)
+        stored_max = tl.where(k_len <= BLOCK_K, l_i, m_i)
+        stored_sum = tl.where(k_len <= BLOCK_K, -1.0, l_i)
         tl.store(partial_ptrs, acc, mask=q_valid[:, None] & d_v_valid[None, :])
         tl.store(partial_max_ptr + stats_ptrs, stored_max, mask=q_valid)
         tl.store(partial_sum_ptr + stats_ptrs, stored_sum, mask=q_valid)
@@ -326,53 +319,57 @@ def _combine_split_kv_metax_kernel(
     stride_out_d,
     NUM_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
-    SPLITS_PAD: tl.constexpr,
+    BLOCK_S: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
-    ALLOW_DIRECT_OUTPUT: tl.constexpr = False,
 ):
     output_id = tl.program_id(0)
     q_global = output_id // NUM_HEADS
     q_head = output_id % NUM_HEADS
     off_d = tl.program_id(1) * BLOCK_D_V + tl.arange(0, BLOCK_D_V)
     d_valid = off_d < HEAD_DIM_V
-    if ALLOW_DIRECT_OUTPUT:
-        first_stats_offset = q_global * stride_stats_t + q_head * stride_stats_h
-        first_sum = tl.load(partial_sum_ptr + first_stats_offset)
-        if first_sum < 0.0:
-            denominator = tl.load(partial_max_ptr + first_stats_offset)
-            partial = tl.load(
-                partial_out_ptr + q_global * stride_partial_t + q_head * stride_partial_h
-                + off_d * stride_partial_d,
-                mask=d_valid,
-                other=0.0,
-            )
-            output = partial / tl.where(denominator > 0.0, denominator, 1.0)
-            tl.store(
-                out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d,
-                output,
-                mask=d_valid,
-            )
-            return
-    split = tl.arange(0, SPLITS_PAD)
-    split_valid = split < NUM_SPLITS
-    stats_offset = split * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
-    split_max = tl.load(partial_max_ptr + stats_offset, mask=split_valid, other=-float("inf"))
-    split_sum = tl.load(partial_sum_ptr + stats_offset, mask=split_valid, other=0.0)
-    global_max = tl.max(split_max, axis=0)
-    max_safe = tl.where(global_max != -float("inf"), global_max, 0.0)
-    split_active = split_valid & (split_max != -float("inf")) & (split_sum > 0.0)
-    weight = tl.where(split_active, tl.exp2(split_max - max_safe), 0.0)
-    denominator = tl.sum(split_sum * weight, axis=0)
-    partial_ptrs = (
-        partial_out_ptr
-        + split[:, None] * stride_partial_s
-        + q_global * stride_partial_t
-        + q_head * stride_partial_h
-        + off_d[None, :] * stride_partial_d
-    )
-    partial = tl.load(partial_ptrs, mask=split_active[:, None] & d_valid[None, :], other=0.0)
-    numerator = tl.sum(partial * weight[:, None], axis=0)
+    first_stats_offset = q_global * stride_stats_t + q_head * stride_stats_h
+    first_sum = tl.load(partial_sum_ptr + first_stats_offset)
+    if first_sum < 0.0:
+        denominator = tl.load(partial_max_ptr + first_stats_offset)
+        partial = tl.load(
+            partial_out_ptr + q_global * stride_partial_t + q_head * stride_partial_h
+            + off_d * stride_partial_d,
+            mask=d_valid,
+            other=0.0,
+        )
+        output = partial / tl.where(denominator > 0.0, denominator, 1.0)
+        tl.store(
+            out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d,
+            output,
+            mask=d_valid,
+        )
+        return
+    running_max = tl.full((), -float("inf"), tl.float32)
+    denominator = tl.full((), 0.0, tl.float32)
+    numerator = tl.zeros([BLOCK_D_V], tl.float32)
+    for split_block in range(tl.cdiv(NUM_SPLITS, BLOCK_S)):
+        split = split_block * BLOCK_S + tl.arange(0, BLOCK_S)
+        split_valid = split < NUM_SPLITS
+        stats_offset = split * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
+        split_max = tl.load(partial_max_ptr + stats_offset, mask=split_valid, other=-float("inf"))
+        split_sum = tl.load(partial_sum_ptr + stats_offset, mask=split_valid, other=0.0)
+        next_max = tl.maximum(running_max, tl.max(split_max, axis=0))
+        max_safe = tl.where(next_max != -float("inf"), next_max, 0.0)
+        previous_weight = tl.exp2(running_max - max_safe)
+        split_active = split_valid & (split_max != -float("inf")) & (split_sum > 0.0)
+        weight = tl.where(split_active, tl.exp2(split_max - max_safe), 0.0)
+        partial_ptrs = (
+            partial_out_ptr
+            + split[:, None] * stride_partial_s
+            + q_global * stride_partial_t
+            + q_head * stride_partial_h
+            + off_d[None, :] * stride_partial_d
+        )
+        partial = tl.load(partial_ptrs, mask=split_active[:, None] & d_valid[None, :], other=0.0)
+        numerator = numerator * previous_weight + tl.sum(partial * weight[:, None], axis=0)
+        denominator = denominator * previous_weight + tl.sum(split_sum * weight, axis=0)
+        running_max = next_max
     denominator_safe = tl.where(denominator > 0.0, denominator, 1.0)
     output = tl.where(denominator > 0.0, numerator / denominator_safe, 0.0)
     out_ptrs = out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d

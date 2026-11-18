@@ -53,7 +53,6 @@ def inkling_fa4_rel_attention_triton(
     heuristic normally selects one split; larger ``num_splits`` values execute
     real split-KV attention followed by a numerically stable FP32 combine.
     """
-    auto_split = num_splits is None
     _validate_inputs(
         q=q,
         key_cache=key_cache,
@@ -115,34 +114,26 @@ def inkling_fa4_rel_attention_triton(
     # work.  Reading cache_seqlens.max().item() here would serialize every
     # serving invocation with the CPU.
     max_seqlen_k_bound = block_table.shape[1] * block_size
-    cfg = launch_configs.get_preset(head_dim_q=head_dim_q, head_dim_v=head_dim_v)
-    block_q = cfg["BLOCK_Q"]
+    dot_tile = launch_configs.DOT_TILE
     pack_gqa = q_heads_per_kv_head > 1
     scheduler_heads = num_kv_heads if pack_gqa else num_heads
     rows_per_q_token = q_heads_per_kv_head if pack_gqa else 1
     max_scheduler_rows = max_seqlen_q * rows_per_q_token
-    max_q_blocks = triton.cdiv(max_scheduler_rows, block_q)
-    num_splits = launch_configs.select_num_splits(
-        num_splits=num_splits,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k_bound,
-        block_k=cfg["BLOCK_K"],
-        query_blocks=max_q_blocks,
-        batch_size=batch_size,
-        scheduler_heads=scheduler_heads,
-        head_dim_q=head_dim_q,
-        head_dim_v=head_dim_v,
-        is_local=is_local,
-        device=q.device,
-    )
-    allow_direct_output = auto_split and num_splits >= 16
+    max_q_blocks = triton.cdiv(max_scheduler_rows, dot_tile)
+    device_properties = torch.cuda.get_device_properties(q.device)
+    if num_splits is None:
+        num_splits = launch_configs.select_num_splits(
+            kv_tiles=triton.cdiv(max_seqlen_k_bound, dot_tile),
+            query_groups=max_q_blocks * batch_size * scheduler_heads,
+            rows_per_group=min(max_scheduler_rows, dot_tile),
+            output_rows=q.shape[0] * num_heads,
+            head_dim_q=head_dim_q,
+            head_dim_v=head_dim_v,
+            element_bytes=q.element_size(),
+            warp_size=device_properties.warp_size,
+            num_sms=device_properties.multi_processor_count,
+        )
     split_kv = num_splits > 1
-    kernel_options = launch_configs.get_kernel_options(
-        head_dim_q=head_dim_q,
-        head_dim_v=head_dim_v,
-        split_kv=split_kv,
-        max_seqlen_q=max_seqlen_q,
-    )
     if split_kv:
         partial_out = torch.empty_strided(
             (num_splits, q.shape[0], num_heads, head_dim_v),
@@ -214,28 +205,23 @@ def inkling_fa4_rel_attention_triton(
         SPLIT_KV=split_kv,
         HEAD_DIM_Q=head_dim_q,
         HEAD_DIM_V=head_dim_v,
-        BLOCK_D_Q=max(16, triton.next_power_of_2(head_dim_q)),
-        BLOCK_D_V=max(16, triton.next_power_of_2(head_dim_v)),
+        BLOCK_D_Q=max(dot_tile, triton.next_power_of_2(head_dim_q)),
+        BLOCK_D_V=max(dot_tile, triton.next_power_of_2(head_dim_v)),
         REL_EXTENT=rel_extent,
         BLOCK_SIZE=block_size,
-        BLOCK_Q=block_q,
-        BLOCK_K=cfg["BLOCK_K"],
+        BLOCK_Q=dot_tile,
+        BLOCK_K=dot_tile,
         CAUSAL=resolved_causal,
         LOCAL=is_local,
         WINDOW_LEFT=0 if window_left is None else window_left,
         WINDOW_RIGHT=0 if window_right is None else window_right,
-        ALLOW_DIRECT_OUTPUT=allow_direct_output,
         SINGLE_QUERY=max_seqlen_q == 1,
-        num_warps=cfg["num_warps"],
-        num_stages=cfg["num_stages"],
-        **kernel_options,
+        num_stages=1,
     )
     if split_kv:
-        combine_block_d, combine_warps = launch_configs.get_combine_config(
-            output_rows=q.shape[0] * num_heads,
-            head_dim_v=head_dim_v,
-            num_splits=num_splits,
-        )
+        warp_size = device_properties.warp_size
+        combine_block_d = min(triton.next_power_of_2(head_dim_v), warp_size)
+        combine_block_s = min(triton.next_power_of_2(num_splits), warp_size)
         combine_grid = (q.shape[0] * num_heads, triton.cdiv(head_dim_v, combine_block_d))
         _combine_split_kv_metax_kernel[combine_grid](
             partial_out_ptr=partial_out,
@@ -254,10 +240,8 @@ def inkling_fa4_rel_attention_triton(
             stride_out_d=out.stride(2),
             NUM_HEADS=num_heads,
             NUM_SPLITS=num_splits,
-            SPLITS_PAD=triton.next_power_of_2(num_splits),
+            BLOCK_S=combine_block_s,
             HEAD_DIM_V=head_dim_v,
             BLOCK_D_V=combine_block_d,
-            num_warps=combine_warps,
-            ALLOW_DIRECT_OUTPUT=allow_direct_output,
         )
     return out

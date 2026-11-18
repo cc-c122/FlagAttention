@@ -14,75 +14,48 @@
 
 from __future__ import annotations
 
-import torch
+from functools import lru_cache
+
 import triton
 
-
-def get_preset(*, head_dim_q: int, head_dim_v: int) -> dict[str, int]:
-    wide = max(head_dim_q, head_dim_v) > 128
-    return {
-        "BLOCK_Q": 16,
-        "BLOCK_K": 16 if wide else 32,
-        "num_warps": 4 if wide else 2,
-        "num_stages": 1,
-    }
+DOT_TILE = 16
+FP32_BYTES = 4
 
 
+@lru_cache
 def select_num_splits(
     *,
-    num_splits: int | None,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    block_k: int,
-    query_blocks: int,
-    batch_size: int,
-    scheduler_heads: int,
-    head_dim_q: int,
-    head_dim_v: int,
-    is_local: bool,
-    device: torch.device,
-) -> int:
-    if num_splits is not None:
-        return num_splits
-    kv_blocks = triton.cdiv(max_seqlen_k, block_k)
-    if is_local or kv_blocks < 8:
-        return 1
-    groups = query_blocks * batch_size * scheduler_heads
-    resident_groups = 4 if max(head_dim_q, head_dim_v) <= 128 else 1
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    parallel_limit = max(1, resident_groups * num_sms // groups)
-    minimum_blocks = 1 if max_seqlen_q == 1 else 2
-    work_limit = max(1, kv_blocks // minimum_blocks)
-    split_limit = min(parallel_limit, work_limit, 128)
-    blocks_per_split = triton.cdiv(kv_blocks, split_limit)
-    return triton.cdiv(kv_blocks, blocks_per_split)
-
-
-def get_kernel_options(
-    *,
-    head_dim_q: int,
-    head_dim_v: int,
-    split_kv: bool,
-    max_seqlen_q: int,
-) -> dict[str, str]:
-    if (
-        (head_dim_q <= 128 or max(head_dim_q, head_dim_v) <= 256)
-        and (split_kv or max_seqlen_q > 1)
-    ):
-        return {"pipeline": ""}
-    return {}
-
-
-def get_combine_config(
-    *,
+    kv_tiles: int,
+    query_groups: int,
+    rows_per_group: int,
     output_rows: int,
+    head_dim_q: int,
     head_dim_v: int,
-    num_splits: int,
-) -> tuple[int, int]:
-    padded_splits = triton.next_power_of_2(num_splits)
-    dimension_limit = 16 if output_rows < 32 and num_splits >= 16 else 128
-    element_limit = max(1, 16384 // padded_splits)
-    block_d = min(dimension_limit, triton.next_power_of_2(head_dim_v), element_limit)
-    elements = padded_splits * block_d
-    warps = min(4, triton.next_power_of_2(triton.cdiv(elements, 4096)))
-    return block_d, warps
+    element_bytes: int,
+    warp_size: int,
+    num_sms: int,
+) -> int:
+    query_bytes = rows_per_group * head_dim_q * element_bytes
+    kv_tile_bytes = DOT_TILE * (head_dim_q + head_dim_v + rows_per_group) * element_bytes
+    output_bytes = rows_per_group * head_dim_v * element_bytes
+    partial_bytes = rows_per_group * (head_dim_v + 2) * FP32_BYTES
+
+    best_splits = 1
+    main_waves = triton.cdiv(query_groups, num_sms)
+    best_wave_bytes = main_waves * (query_bytes + kv_tiles * kv_tile_bytes + output_bytes)
+
+    combine_width = min(head_dim_v, warp_size)
+    combine_groups = output_rows * triton.cdiv(head_dim_v, combine_width)
+    combine_waves = triton.cdiv(combine_groups, num_sms)
+    combine_output_bytes = combine_width * element_bytes
+    combine_partial_bytes = (combine_width + 2) * FP32_BYTES
+    for splits in range(2, min(kv_tiles, num_sms) + 1):
+        main_waves = triton.cdiv(query_groups * splits, num_sms)
+        tiles_per_split = triton.cdiv(kv_tiles, splits)
+        main_bytes = main_waves * (query_bytes + tiles_per_split * kv_tile_bytes + partial_bytes)
+        combine_bytes = combine_waves * (FP32_BYTES + splits * combine_partial_bytes + combine_output_bytes)
+        wave_bytes = main_bytes + combine_bytes
+        if wave_bytes < best_wave_bytes:
+            best_splits = splits
+            best_wave_bytes = wave_bytes
+    return best_splits
