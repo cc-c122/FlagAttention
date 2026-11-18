@@ -24,8 +24,6 @@ from flag_attn.inkling_fa4.relative_attention import _validate_inputs
 from .kernels import _combine_split_kv_metax_kernel, _fa4_rel_attn_paged_kernel
 
 _DOT_TILE = 16
-_FP32_BYTES = 4
-_SPLIT_LAUNCH_COST_TILES = 16
 
 
 @lru_cache
@@ -33,41 +31,25 @@ def _select_num_splits(
     *,
     kv_tiles: int,
     query_groups: int,
-    rows_per_group: int,
-    output_rows: int,
-    head_dim_q: int,
-    head_dim_v: int,
-    element_bytes: int,
-    warp_size: int,
+    single_query: bool,
+    wide_heads: bool,
     num_sms: int,
 ) -> int:
-    query_bytes = rows_per_group * head_dim_q * element_bytes
-    kv_tile_bytes = _DOT_TILE * (head_dim_q + head_dim_v + rows_per_group) * element_bytes
-    output_bytes = rows_per_group * head_dim_v * element_bytes
-    partial_bytes = rows_per_group * (head_dim_v + 2) * _FP32_BYTES
+    groups_per_sm = 1 if wide_heads else 4
+    parallel_limit = max(1, groups_per_sm * num_sms // query_groups)
+    tiles_per_group = 1 if single_query else 2
+    work_limit = max(1, kv_tiles // tiles_per_group)
+    split_limit = min(parallel_limit, work_limit, 128)
+    tiles_per_split = triton.cdiv(kv_tiles, split_limit)
+    return triton.cdiv(kv_tiles, tiles_per_split)
 
-    groups_per_sm = 2 if max(head_dim_q, head_dim_v) <= 128 else 1
-    main_capacity = groups_per_sm * num_sms
-    best_splits = 1
-    main_waves = triton.cdiv(query_groups, main_capacity)
-    best_wave_bytes = main_waves * (query_bytes + kv_tiles * kv_tile_bytes + output_bytes)
 
-    combine_width = min(head_dim_v, warp_size)
-    combine_groups = output_rows * triton.cdiv(head_dim_v, combine_width)
-    combine_waves = triton.cdiv(combine_groups, num_sms)
-    combine_output_bytes = combine_width * element_bytes
-    combine_partial_bytes = (combine_width + 2) * _FP32_BYTES
-    split_launch_cost = _SPLIT_LAUNCH_COST_TILES * kv_tile_bytes
-    for splits in range(2, min(kv_tiles, main_capacity) + 1):
-        main_waves = triton.cdiv(query_groups * splits, main_capacity)
-        tiles_per_split = triton.cdiv(kv_tiles, splits)
-        main_bytes = main_waves * (query_bytes + tiles_per_split * kv_tile_bytes + partial_bytes)
-        combine_bytes = combine_waves * (_FP32_BYTES + splits * combine_partial_bytes + combine_output_bytes)
-        wave_bytes = main_bytes + combine_bytes + split_launch_cost
-        if wave_bytes < best_wave_bytes:
-            best_splits = splits
-            best_wave_bytes = wave_bytes
-    return best_splits
+def _combine_config(*, output_rows: int, head_dim_v: int, num_splits: int) -> tuple[int, int, int]:
+    block_s = min(triton.next_power_of_2(num_splits), 128)
+    dimension_limit = 16 if output_rows < 32 and num_splits >= 16 else 128
+    block_d = min(triton.next_power_of_2(head_dim_v), dimension_limit, 16384 // block_s)
+    num_warps = min(4, triton.next_power_of_2(triton.cdiv(block_s * block_d, 4096)))
+    return block_s, block_d, num_warps
 
 
 @torch.no_grad()
@@ -162,29 +144,34 @@ def inkling_fa4_rel_attention_triton(
     # serving invocation with the CPU.
     max_seqlen_k_bound = block_table.shape[1] * block_size
     dot_tile = _DOT_TILE
+    wide_heads = max(head_dim_q, head_dim_v) > 128
+    block_k = 16 if wide_heads else 32
+    main_warps = 4 if wide_heads else 2
     pack_gqa = q_heads_per_kv_head > 1
     scheduler_heads = num_kv_heads if pack_gqa else num_heads
     rows_per_q_token = q_heads_per_kv_head if pack_gqa else 1
     max_scheduler_rows = max_seqlen_q * rows_per_q_token
     max_q_blocks = triton.cdiv(max_scheduler_rows, dot_tile)
-    device_properties = torch.cuda.get_device_properties(q.device)
     if num_splits is None:
-        kv_tiles = triton.cdiv(max_seqlen_k_bound, dot_tile)
+        kv_tiles = triton.cdiv(max_seqlen_k_bound, block_k)
         if is_local and window_left is not None and window_right is not None:
             window_tokens = window_left + window_right + min(max_seqlen_q, dot_tile)
-            kv_tiles = min(kv_tiles, triton.cdiv(window_tokens + dot_tile - 1, dot_tile))
-        num_splits = _select_num_splits(
-            kv_tiles=kv_tiles,
-            query_groups=max_q_blocks * batch_size * scheduler_heads,
-            rows_per_group=min(max_scheduler_rows, dot_tile),
-            output_rows=q.shape[0] * num_heads,
-            head_dim_q=head_dim_q,
-            head_dim_v=head_dim_v,
-            element_bytes=q.element_size(),
-            warp_size=device_properties.warp_size,
-            num_sms=device_properties.multi_processor_count,
-        )
+            kv_tiles = min(kv_tiles, triton.cdiv(window_tokens + block_k - 1, block_k))
+        if kv_tiles <= (16 if is_local else 8):
+            num_splits = 1
+        else:
+            num_splits = _select_num_splits(
+                kv_tiles=kv_tiles,
+                query_groups=max_q_blocks * batch_size * scheduler_heads,
+                single_query=max_seqlen_q == 1,
+                wide_heads=wide_heads,
+                num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+            )
     split_kv = num_splits > 1
+    single_tile_shortcut = num_splits >= 16
+    kernel_options = {}
+    if (head_dim_q <= 128 or max(head_dim_q, head_dim_v) <= 256) and (split_kv or max_seqlen_q > 1):
+        kernel_options["pipeline"] = ""
     if split_kv:
         partial_out = torch.empty_strided(
             (num_splits, q.shape[0], num_heads, head_dim_v),
@@ -259,21 +246,26 @@ def inkling_fa4_rel_attention_triton(
         BLOCK_D_Q=max(dot_tile, triton.next_power_of_2(head_dim_q)),
         BLOCK_D_V=max(dot_tile, triton.next_power_of_2(head_dim_v)),
         REL_EXTENT=rel_extent,
-        REL_COVERS_KV=rel_extent >= max_seqlen_k_bound,
+        REL_COVERS_VISIBLE_PAST=rel_extent >= max_seqlen_k_bound or (is_local and window_left < rel_extent),
         BLOCK_SIZE=block_size,
         BLOCK_Q=dot_tile,
-        BLOCK_K=dot_tile,
+        BLOCK_K=block_k,
         CAUSAL=resolved_causal,
         LOCAL=is_local,
         WINDOW_LEFT=0 if window_left is None else window_left,
         WINDOW_RIGHT=0 if window_right is None else window_right,
         SINGLE_QUERY=max_seqlen_q == 1,
+        SINGLE_TILE_SHORTCUT=single_tile_shortcut,
+        num_warps=main_warps,
         num_stages=1,
+        **kernel_options,
     )
     if split_kv:
-        warp_size = device_properties.warp_size
-        combine_block_d = min(triton.next_power_of_2(head_dim_v), warp_size)
-        combine_block_s = min(triton.next_power_of_2(num_splits), warp_size)
+        combine_block_s, combine_block_d, combine_warps = _combine_config(
+            output_rows=q.shape[0] * num_heads,
+            head_dim_v=head_dim_v,
+            num_splits=num_splits,
+        )
         combine_grid = (q.shape[0] * num_heads, triton.cdiv(head_dim_v, combine_block_d))
         _combine_split_kv_metax_kernel[combine_grid](
             partial_out_ptr=partial_out,
@@ -293,7 +285,9 @@ def inkling_fa4_rel_attention_triton(
             NUM_HEADS=num_heads,
             NUM_SPLITS=num_splits,
             BLOCK_S=combine_block_s,
+            SINGLE_TILE_SHORTCUT=single_tile_shortcut,
             HEAD_DIM_V=head_dim_v,
             BLOCK_D_V=combine_block_d,
+            num_warps=combine_warps,
         )
     return out

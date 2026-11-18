@@ -68,7 +68,7 @@ def _fa4_rel_attn_paged_kernel(
     BLOCK_D_Q: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
     REL_EXTENT: tl.constexpr,
-    REL_COVERS_KV: tl.constexpr,
+    REL_COVERS_VISIBLE_PAST: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -76,6 +76,7 @@ def _fa4_rel_attn_paged_kernel(
     LOCAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
+    SINGLE_TILE_SHORTCUT: tl.constexpr,
     SINGLE_QUERY: tl.constexpr = False,
 ):
     # The regular 3D grid directly encodes (Q block, sequence/head, split).
@@ -149,7 +150,7 @@ def _fa4_rel_attn_paged_kernel(
     q_global = q_start + q_local
     q_pos = q_local + k_len - q_len
 
-    if SPLIT_KV:
+    if SPLIT_KV and SINGLE_TILE_SHORTCUT:
         if k_len <= BLOCK_K and split_idx > 0:
             return
 
@@ -191,16 +192,17 @@ def _fa4_rel_attn_paged_kernel(
     block_start = valid_block_start + split_idx * blocks_per_split + tl.minimum(split_idx, extra_blocks)
     block_end = block_start + blocks_per_split + (split_idx < extra_blocks).to(tl.int32)
     no_future_keys: tl.constexpr = CAUSAL or (LOCAL and WINDOW_RIGHT <= 0)
-    all_keys_have_bias: tl.constexpr = REL_COVERS_KV and no_future_keys
-    if not all_keys_have_bias:
+    all_keys_have_bias: tl.constexpr = REL_COVERS_VISIBLE_PAST and no_future_keys
+    split_bias_range: tl.constexpr = not all_keys_have_bias and BLOCK_D_Q <= 128 and BLOCK_D_V <= 128
+    if split_bias_range:
         first_bias_tile = tl.maximum(0, q_pos_min - REL_EXTENT + 1) // BLOCK_K
         bias_start = tl.minimum(block_end, tl.maximum(block_start, first_bias_tile))
         if not no_future_keys:
             past_bias_tile = tl.cdiv(tl.maximum(0, q_pos_max + 1), BLOCK_K)
             bias_end = tl.maximum(bias_start, tl.minimum(block_end, past_bias_tile))
-    phases: tl.constexpr = 1 if all_keys_have_bias else (2 if no_future_keys else 3)
+    phases: tl.constexpr = (2 if no_future_keys else 3) if split_bias_range else 1
     for phase in tl.static_range(phases):
-        if all_keys_have_bias:
+        if not split_bias_range:
             range_start, range_end = block_start, block_end
         elif phase == 0:
             range_start, range_end = block_start, bias_start
@@ -226,6 +228,17 @@ def _fa4_rel_attn_paged_kernel(
                     other=0,
                 )
                 physical_block = physical_page + tl.zeros([BLOCK_K], tl.int32)
+            elif BLOCK_K % BLOCK_SIZE == 0:
+                pages_per_tile: tl.constexpr = BLOCK_K // BLOCK_SIZE
+                pages = block_k * pages_per_tile + tl.arange(0, pages_per_tile)
+                physical_pages = tl.load(
+                    block_table_ptr + seq_id * stride_bt_b + pages * stride_bt_block,
+                    mask=pages * BLOCK_SIZE < k_len,
+                    other=0,
+                )
+                physical_block = tl.reshape(
+                    tl.broadcast_to(physical_pages[:, None], (pages_per_tile, BLOCK_SIZE)), (BLOCK_K,)
+                )
             else:
                 physical_block = tl.load(
                     block_table_ptr + seq_id * stride_bt_b + logical_block * stride_bt_block,
@@ -234,21 +247,19 @@ def _fa4_rel_attn_paged_kernel(
                 )
 
             mask = q_valid[:, None] & k_valid[None, :]
-            if CAUSAL:
+            if CAUSAL and not SINGLE_QUERY:
                 mask = mask & (k_local[None, :] <= q_pos[:, None])
             if LOCAL:
                 mask = mask & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
             if LOCAL:
                 mask = mask & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
-            if all_keys_have_bias or phase == 1:
+            if not split_bias_range or phase == 1:
                 if all_keys_have_bias:
                     bias_mask = mask
                 else:
-                    bias_mask = (
-                        mask
-                        & (k_local[None, :] <= q_pos[:, None])
-                        & (k_local[None, :] > q_pos[:, None] - REL_EXTENT)
-                    )
+                    bias_mask = mask & (k_local[None, :] > q_pos[:, None] - REL_EXTENT)
+                    if not no_future_keys:
+                        bias_mask &= k_local[None, :] <= q_pos[:, None]
                 rel_ptrs = (
                     rel_ptr + q_global[:, None] * stride_rel_t + q_head_offset * stride_rel_h
                     + q_pos[:, None] * stride_rel_d - k_local[None, :] * stride_rel_d
@@ -269,7 +280,7 @@ def _fa4_rel_attn_paged_kernel(
             )
             scores = tl.dot(q_value, tl.trans(k_value)).to(tl.float32) * softmax_scale
 
-            if all_keys_have_bias or phase == 1:
+            if not split_bias_range or phase == 1:
                 scores += rel_bias.to(tl.float32)
 
             # Hopper's approximate exp2 path is cheaper. Convert the *complete*
@@ -317,8 +328,11 @@ def _fa4_rel_attn_paged_kernel(
             + off_d_v[None, :] * stride_partial_d
         )
         stats_ptrs = split_idx * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
-        stored_max = tl.where(k_len <= BLOCK_K, l_i, m_i)
-        stored_sum = tl.where(k_len <= BLOCK_K, -1.0, l_i)
+        stored_max = m_i
+        stored_sum = l_i
+        if SINGLE_TILE_SHORTCUT:
+            stored_max = tl.where(k_len <= BLOCK_K, l_i, m_i)
+            stored_sum = tl.where(k_len <= BLOCK_K, -1.0, l_i)
         tl.store(partial_ptrs, acc, mask=q_valid[:, None] & d_v_valid[None, :])
         tl.store(partial_max_ptr + stats_ptrs, stored_max, mask=q_valid)
         tl.store(partial_sum_ptr + stats_ptrs, stored_sum, mask=q_valid)
@@ -350,6 +364,7 @@ def _combine_split_kv_metax_kernel(
     NUM_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    SINGLE_TILE_SHORTCUT: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
 ):
@@ -358,23 +373,24 @@ def _combine_split_kv_metax_kernel(
     q_head = output_id % NUM_HEADS
     off_d = tl.program_id(1) * BLOCK_D_V + tl.arange(0, BLOCK_D_V)
     d_valid = off_d < HEAD_DIM_V
-    first_stats_offset = q_global * stride_stats_t + q_head * stride_stats_h
-    first_sum = tl.load(partial_sum_ptr + first_stats_offset)
-    if first_sum < 0.0:
-        denominator = tl.load(partial_max_ptr + first_stats_offset)
-        partial = tl.load(
-            partial_out_ptr + q_global * stride_partial_t + q_head * stride_partial_h
-            + off_d * stride_partial_d,
-            mask=d_valid,
-            other=0.0,
-        )
-        output = partial / tl.where(denominator > 0.0, denominator, 1.0)
-        tl.store(
-            out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d,
-            output,
-            mask=d_valid,
-        )
-        return
+    if SINGLE_TILE_SHORTCUT:
+        first_stats_offset = q_global * stride_stats_t + q_head * stride_stats_h
+        first_sum = tl.load(partial_sum_ptr + first_stats_offset)
+        if first_sum < 0.0:
+            denominator = tl.load(partial_max_ptr + first_stats_offset)
+            partial = tl.load(
+                partial_out_ptr + q_global * stride_partial_t + q_head * stride_partial_h
+                + off_d * stride_partial_d,
+                mask=d_valid,
+                other=0.0,
+            )
+            output = partial / tl.where(denominator > 0.0, denominator, 1.0)
+            tl.store(
+                out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d,
+                output,
+                mask=d_valid,
+            )
+            return
     running_max = tl.full((), -float("inf"), tl.float32)
     denominator = tl.full((), 0.0, tl.float32)
     numerator = tl.zeros([BLOCK_D_V], tl.float32)
@@ -384,9 +400,10 @@ def _combine_split_kv_metax_kernel(
         stats_offset = split * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
         split_max = tl.load(partial_max_ptr + stats_offset, mask=split_valid, other=-float("inf"))
         split_sum = tl.load(partial_sum_ptr + stats_offset, mask=split_valid, other=0.0)
-        next_max = tl.maximum(running_max, tl.max(split_max, axis=0))
+        next_max = tl.max(split_max, axis=0)
+        if NUM_SPLITS > BLOCK_S:
+            next_max = tl.maximum(running_max, next_max)
         max_safe = tl.where(next_max != -float("inf"), next_max, 0.0)
-        previous_weight = tl.exp2(running_max - max_safe)
         split_active = split_valid & (split_max != -float("inf")) & (split_sum > 0.0)
         weight = tl.where(split_active, tl.exp2(split_max - max_safe), 0.0)
         partial_ptrs = (
@@ -397,9 +414,16 @@ def _combine_split_kv_metax_kernel(
             + off_d[None, :] * stride_partial_d
         )
         partial = tl.load(partial_ptrs, mask=split_active[:, None] & d_valid[None, :], other=0.0)
-        numerator = numerator * previous_weight + tl.sum(partial * weight[:, None], axis=0)
-        denominator = denominator * previous_weight + tl.sum(split_sum * weight, axis=0)
-        running_max = next_max
+        block_numerator = tl.sum(partial * weight[:, None], axis=0)
+        block_denominator = tl.sum(split_sum * weight, axis=0)
+        if NUM_SPLITS > BLOCK_S:
+            previous_weight = tl.exp2(running_max - max_safe)
+            numerator = numerator * previous_weight + block_numerator
+            denominator = denominator * previous_weight + block_denominator
+            running_max = next_max
+        else:
+            numerator = block_numerator
+            denominator = block_denominator
     denominator_safe = tl.where(denominator > 0.0, denominator, 1.0)
     output = tl.where(denominator > 0.0, numerator / denominator_safe, 0.0)
     out_ptrs = out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d
