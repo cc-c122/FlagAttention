@@ -208,6 +208,7 @@ def inkling_fa4_rel_attention_triton(
         BLOCK_D_Q=max(dot_tile, triton.next_power_of_2(head_dim_q)),
         BLOCK_D_V=max(dot_tile, triton.next_power_of_2(head_dim_v)),
         REL_EXTENT=rel_extent,
+        REL_COVERS_KV=rel_extent >= max_seqlen_k_bound,
         BLOCK_SIZE=block_size,
         BLOCK_Q=dot_tile,
         BLOCK_K=dot_tile,

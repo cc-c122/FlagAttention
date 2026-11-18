@@ -68,6 +68,7 @@ def _fa4_rel_attn_paged_kernel(
     BLOCK_D_Q: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
     REL_EXTENT: tl.constexpr,
+    REL_COVERS_KV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -189,94 +190,123 @@ def _fa4_rel_attn_paged_kernel(
     extra_blocks = valid_blocks % NUM_SPLITS
     block_start = valid_block_start + split_idx * blocks_per_split + tl.minimum(split_idx, extra_blocks)
     block_end = block_start + blocks_per_split + (split_idx < extra_blocks).to(tl.int32)
-    for block_k in range(block_start, block_end):
-        k_local = block_k * BLOCK_K + off_k
-        k_valid = k_local < k_len
-        logical_block = k_local // BLOCK_SIZE
-        offset_in_block = k_local % BLOCK_SIZE
-        # A page-aligned tile needs one page-table scalar instead of BLOCK_K
-        # identical entries. Keep the vector gather for the common 16-token
-        # page / 64-or-128-token compute tile case.
-        if BLOCK_K == BLOCK_SIZE:
-            physical_page = tl.load(
-                block_table_ptr + seq_id * stride_bt_b + block_k * stride_bt_block,
-                mask=block_k < num_k_blocks,
-                other=0,
-            )
-            physical_block = physical_page + tl.zeros([BLOCK_K], tl.int32)
+    no_future_keys: tl.constexpr = CAUSAL or (LOCAL and WINDOW_RIGHT <= 0)
+    all_keys_have_bias: tl.constexpr = REL_COVERS_KV and no_future_keys
+    if not all_keys_have_bias:
+        first_bias_tile = tl.maximum(0, q_pos_min - REL_EXTENT + 1) // BLOCK_K
+        bias_start = tl.minimum(block_end, tl.maximum(block_start, first_bias_tile))
+        if not no_future_keys:
+            past_bias_tile = tl.cdiv(tl.maximum(0, q_pos_max + 1), BLOCK_K)
+            bias_end = tl.maximum(bias_start, tl.minimum(block_end, past_bias_tile))
+    phases: tl.constexpr = 1 if all_keys_have_bias else (2 if no_future_keys else 3)
+    for phase in tl.static_range(phases):
+        if all_keys_have_bias:
+            range_start, range_end = block_start, block_end
+        elif phase == 0:
+            range_start, range_end = block_start, bias_start
+        elif phase == 1:
+            if no_future_keys:
+                range_start, range_end = bias_start, block_end
+            else:
+                range_start, range_end = bias_start, bias_end
         else:
-            physical_block = tl.load(
-                block_table_ptr + seq_id * stride_bt_b + logical_block * stride_bt_block,
-                mask=k_valid,
-                other=0,
+            range_start, range_end = bias_end, block_end
+        for block_k in range(range_start, range_end):
+            k_local = block_k * BLOCK_K + off_k
+            k_valid = k_local < k_len
+            logical_block = k_local // BLOCK_SIZE
+            offset_in_block = k_local % BLOCK_SIZE
+            # A page-aligned tile needs one page-table scalar instead of BLOCK_K
+            # identical entries. Keep the vector gather for the common 16-token
+            # page / 64-or-128-token compute tile case.
+            if BLOCK_K == BLOCK_SIZE:
+                physical_page = tl.load(
+                    block_table_ptr + seq_id * stride_bt_b + block_k * stride_bt_block,
+                    mask=block_k < num_k_blocks,
+                    other=0,
+                )
+                physical_block = physical_page + tl.zeros([BLOCK_K], tl.int32)
+            else:
+                physical_block = tl.load(
+                    block_table_ptr + seq_id * stride_bt_b + logical_block * stride_bt_block,
+                    mask=k_valid,
+                    other=0,
+                )
+
+            mask = q_valid[:, None] & k_valid[None, :]
+            if CAUSAL:
+                mask = mask & (k_local[None, :] <= q_pos[:, None])
+            if LOCAL:
+                mask = mask & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
+            if LOCAL:
+                mask = mask & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
+            if all_keys_have_bias or phase == 1:
+                if all_keys_have_bias:
+                    bias_mask = mask
+                else:
+                    bias_mask = (
+                        mask
+                        & (k_local[None, :] <= q_pos[:, None])
+                        & (k_local[None, :] > q_pos[:, None] - REL_EXTENT)
+                    )
+                rel_ptrs = (
+                    rel_ptr + q_global[:, None] * stride_rel_t + q_head_offset * stride_rel_h
+                    + q_pos[:, None] * stride_rel_d - k_local[None, :] * stride_rel_d
+                )
+                rel_bias = tl.load(rel_ptrs, mask=bias_mask, other=0.0)
+
+            k_ptrs = (
+                k_ptr
+                + physical_block[:, None] * stride_k_block
+                + offset_in_block[:, None] * stride_k_t
+                + kv_head * stride_k_h
+                + off_d_q[None, :] * stride_k_d
+            )
+            k_value = tl.load(
+                k_ptrs,
+                mask=k_valid[:, None] & d_q_valid[None, :],
+                other=0.0,
+            )
+            scores = tl.dot(q_value, tl.trans(k_value)).to(tl.float32) * softmax_scale
+
+            if all_keys_have_bias or phase == 1:
+                scores += rel_bias.to(tl.float32)
+
+            # Hopper's approximate exp2 path is cheaper. Convert the *complete*
+            # score, including relative bias, so the operator remains unchanged.
+            scores = tl.where(
+                mask,
+                scores * 1.4426950408889634,
+                -float("inf"),
             )
 
-        mask = q_valid[:, None] & k_valid[None, :]
-        if CAUSAL:
-            mask = mask & (k_local[None, :] <= q_pos[:, None])
-        if LOCAL:
-            mask = mask & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
-        if LOCAL:
-            mask = mask & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
-        rel_in_range = (
-            (k_local[None, :] <= q_pos[:, None])
-            & (k_local[None, :] > q_pos[:, None] - REL_EXTENT)
-        )
-        rel_ptrs = (
-            rel_ptr + q_global[:, None] * stride_rel_t + q_head_offset * stride_rel_h
-            + q_pos[:, None] * stride_rel_d - k_local[None, :] * stride_rel_d
-        )
-        rel_bias = tl.load(rel_ptrs, mask=mask & rel_in_range, other=0.0)
+            tile_max = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, tile_max)
+            row_has_value = m_new != -float("inf")
+            m_safe = tl.where(row_has_value, m_new, 0.0)
+            alpha = tl.where(
+                m_i == -float("inf"),
+                0.0,
+                tl.exp2(m_i - m_safe),
+            )
+            probabilities = tl.exp2(scores - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(probabilities, axis=1)
+            acc = acc * alpha[:, None]
 
-        k_ptrs = (
-            k_ptr
-            + physical_block[:, None] * stride_k_block
-            + offset_in_block[:, None] * stride_k_t
-            + kv_head * stride_k_h
-            + off_d_q[None, :] * stride_k_d
-        )
-        k_value = tl.load(
-            k_ptrs,
-            mask=k_valid[:, None] & d_q_valid[None, :],
-            other=0.0,
-        )
-        scores = tl.dot(q_value, tl.trans(k_value)).to(tl.float32) * softmax_scale
-
-        # Hopper's approximate exp2 path is cheaper. Convert the *complete*
-        # score, including relative bias, so the operator remains unchanged.
-        scores = tl.where(
-            mask,
-            (scores + rel_bias.to(tl.float32)) * 1.4426950408889634,
-            -float("inf"),
-        )
-
-        tile_max = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, tile_max)
-        row_has_value = m_new != -float("inf")
-        m_safe = tl.where(row_has_value, m_new, 0.0)
-        alpha = tl.where(
-            m_i == -float("inf"),
-            0.0,
-            tl.exp2(m_i - m_safe),
-        )
-        probabilities = tl.exp2(scores - m_safe[:, None])
-        l_i = l_i * alpha + tl.sum(probabilities, axis=1)
-        acc = acc * alpha[:, None]
-
-        v_ptrs = (
-            v_ptr
-            + physical_block[:, None] * stride_v_block
-            + offset_in_block[:, None] * stride_v_t
-            + kv_head * stride_v_h
-            + off_d_v[None, :] * stride_v_d
-        )
-        v_value = tl.load(
-            v_ptrs,
-            mask=k_valid[:, None] & d_v_valid[None, :],
-            other=0.0,
-        )
-        acc = tl.dot(probabilities.to(v_value.dtype), v_value, acc)
-        m_i = m_new
+            v_ptrs = (
+                v_ptr
+                + physical_block[:, None] * stride_v_block
+                + offset_in_block[:, None] * stride_v_t
+                + kv_head * stride_v_h
+                + off_d_v[None, :] * stride_v_d
+            )
+            v_value = tl.load(
+                v_ptrs,
+                mask=k_valid[:, None] & d_v_valid[None, :],
+                other=0.0,
+            )
+            acc = tl.dot(probabilities.to(v_value.dtype), v_value, acc)
+            m_i = m_new
 
     if SPLIT_KV:
         partial_ptrs = (
