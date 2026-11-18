@@ -37,6 +37,15 @@ def _scores_kernel(
 
 
 @triton.jit
+def _tile_indices(GROUPS: tl.constexpr, TILES: tl.constexpr):
+    index = tl.program_id(0).to(tl.int64)
+    group = (index // TILES) % GROUPS
+    batch_head = index // (TILES * GROUPS)
+    tile = (index % TILES).to(tl.int32)
+    return group, batch_head, tile
+
+
+@triton.jit
 def _local_fwd_kernel(
     q,
     k,
@@ -47,7 +56,7 @@ def _local_fwd_kernel(
     local_output,
     states,
     chunk_gates,
-    scores,
+    weighted_scores,
     cached_states,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -59,24 +68,11 @@ def _local_fwd_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
-    PRECOMPUTE_SCORES: tl.constexpr,
     CACHE_STATES: tl.constexpr,
     RETURN_TILE: tl.constexpr = False,
-    KEY_TILE: tl.constexpr = -1,
-    WEIGHTED_SCORES: tl.constexpr = False,
-    TILE_FIRST: tl.constexpr = False,
 ):
-    if TILE_FIRST:
-        tiles: tl.constexpr = NV if KEY_TILE >= 0 else NK * NV
-        index = tl.program_id(0).to(tl.int64)
-        chunk_index = index // tiles % NT
-        batch_head = index // (tiles * NT)
-        tile_index = (index % tiles).to(tl.int32)
-    else:
-        chunk_index = tl.program_id(0).to(tl.int64)
-        batch_head = tl.program_id(1).to(tl.int64)
-        tile_index = tl.program_id(2)
-    key_tile = tile_index // NV if KEY_TILE < 0 else KEY_TILE
+    chunk_index, batch_head, tile_index = _tile_indices(GROUPS=NT, TILES=NK * NV)
+    key_tile = tile_index // NV
     value_tile = tile_index % NV
     batch_index = batch_head // H
     head_index = batch_head % H
@@ -92,19 +88,15 @@ def _local_fwd_kernel(
     b_g = tl.load(g + (batch_index * T + token_offsets) * H + head_index)
     row = offsets_t[:, None]
     col = offsets_t[None, :]
-    if WEIGHTED_SCORES:
+    if weighted_scores is not None:
         score_base = (((batch_index * NT + chunk_index) * H + head_index) * NK + key_tile) * BLOCK_T * BLOCK_T
-        b_score = tl.load(scores + score_base + row * BLOCK_T + col)
+        b_score = tl.load(weighted_scores + score_base + row * BLOCK_T + col)
     else:
         b_level = tl.load(level_lut + row * BLOCK_T + col)
         scale_ptrs = level_scales + ((batch_index * T + token_offsets[:, None]) * H + head_index) * L + b_level
         b_level_scale = tl.load(scale_ptrs).to(tl.float32)
-        if PRECOMPUTE_SCORES:
-            score_base = ((batch_index * NT + chunk_index) * NK + key_tile) * BLOCK_T * BLOCK_T
-            b_score = tl.load(scores + score_base + row * BLOCK_T + col)
-        else:
-            b_q = tl.load(q_ptrs).to(tl.float32)
-            b_score = tl.dot(b_q.to(q.dtype.element_ty), tl.trans(b_k.to(k.dtype.element_ty)))
+        b_q = tl.load(q_ptrs).to(tl.float32)
+        b_score = tl.dot(b_q.to(q.dtype.element_ty), tl.trans(b_k.to(k.dtype.element_ty)))
         b_score *= tl.exp(b_g[:, None] - b_g[None, :]) * b_level_scale
         b_score = tl.where(row >= col, b_score, 0.0)
     b_output = tl.dot(b_score.to(v.dtype.element_ty), b_v.to(v.dtype.element_ty))
@@ -156,19 +148,9 @@ def _merge_states_kernel(
     CACHE_STATES: tl.constexpr,
     FIRST_LEVEL: tl.constexpr,
     STORE_STATES: tl.constexpr = True,
-    TILE_FIRST: tl.constexpr = False,
 ):
-    if TILE_FIRST:
-        tiles: tl.constexpr = K // BK * NV
-        nodes: tl.constexpr = NT >> LEVEL if STORE_STATES else NT >> LEVEL + 1
-        index = tl.program_id(0).to(tl.int64)
-        node_index = index // tiles % nodes
-        batch_head = index // (tiles * nodes)
-        tile_index = (index % tiles).to(tl.int32)
-    else:
-        node_index = tl.program_id(0).to(tl.int64)
-        batch_head = tl.program_id(1).to(tl.int64)
-        tile_index = tl.program_id(2)
+    nodes: tl.constexpr = NT >> LEVEL if STORE_STATES else NT >> (LEVEL + 1)
+    node_index, batch_head, tile_index = _tile_indices(GROUPS=nodes, TILES=K // BK * NV)
     if not STORE_STATES:
         node_index *= 2
     key_tile = tile_index // NV
@@ -264,23 +246,10 @@ def _inter_fwd_kernel(
     initial_q=None,
     initial_g=None,
     USE_INITIAL_TILES: tl.constexpr = False,
-    KEY_TILE: tl.constexpr = -1,
-    RETURN_TILE: tl.constexpr = False,
     query_factors=None,
-    PRECOMPUTE_QUERY: tl.constexpr = False,
-    TILE_FIRST: tl.constexpr = False,
 ):
-    if TILE_FIRST:
-        tiles: tl.constexpr = NV if KEY_TILE >= 0 else NK * NV
-        index = tl.program_id(0).to(tl.int64)
-        chunk_index = index // tiles % NT
-        batch_head = index // (tiles * NT)
-        tile_index = (index % tiles).to(tl.int32)
-    else:
-        chunk_index = tl.program_id(0).to(tl.int64)
-        batch_head = tl.program_id(1).to(tl.int64)
-        tile_index = tl.program_id(2)
-    key_tile = tile_index // NV if KEY_TILE < 0 else KEY_TILE
+    chunk_index, batch_head, tile_index = _tile_indices(GROUPS=NT, TILES=NK * NV)
+    key_tile = tile_index // NV
     value_tile = tile_index % NV
     batch_index = batch_head // H
     head_index = batch_head % H
@@ -322,7 +291,7 @@ def _inter_fwd_kernel(
                 + offsets_v[None, :]
             )
             b_state = tl.load(states + state_base)
-            if PRECOMPUTE_QUERY:
+            if query_factors is not None:
                 factor_base = (((batch_index * NT + chunk_index) * H + head_index) * NUM_LEVELS + level) * BLOCK_T
                 query_factor = tl.load(query_factors + factor_base + offsets_t)
                 b_q_scaled = b_q * query_factor[:, None]
@@ -331,22 +300,19 @@ def _inter_fwd_kernel(
                 b_scale = tl.load(scale_ptrs).to(tl.float32)
                 b_q_scaled = b_q * (b_scale * tl.exp(b_g + later_decay))[:, None]
             b_output += tl.dot(b_q_scaled.to(q.dtype.element_ty), b_state.to(q.dtype.element_ty))
-            if not PRECOMPUTE_QUERY:
+            if query_factors is None:
                 offsets_chunk = tl.arange(0, MAX_BLOCK)
                 gate_ptrs = (
                     chunk_gates + (batch_index * NT + current_end - block_size + 1 + offsets_chunk) * H + head_index
                 )
                 later_decay += tl.sum(tl.load(gate_ptrs, mask=offsets_chunk < block_size, other=0.0), axis=0)
             current_end -= block_size
-    if RETURN_TILE:
-        return b_output
-    else:
-        output_ptrs = (
-            output
-            + (((batch_index * T + token_offsets[:, None]) * H + head_index) * NK + key_tile) * V
-            + offsets_v[None, :]
-        )
-        tl.store(output_ptrs, b_output.to(output.dtype.element_ty))
+    output_ptrs = (
+        output
+        + (((batch_index * T + token_offsets[:, None]) * H + head_index) * NK + key_tile) * V
+        + offsets_v[None, :]
+    )
+    tl.store(output_ptrs, b_output.to(output.dtype.element_ty))
 
 
 @triton.jit
@@ -410,19 +376,8 @@ def _paired_states_kernel(
     BV: tl.constexpr,
     NV: tl.constexpr,
     STORE_STATES: tl.constexpr = True,
-    TILE_FIRST: tl.constexpr = False,
 ):
-    if TILE_FIRST:
-        tiles: tl.constexpr = K // BK * NV
-        groups: tl.constexpr = NT // 2
-        index = tl.program_id(0).to(tl.int64)
-        pair = index // tiles % groups
-        batch_head = index // (tiles * groups)
-        tile = (index % tiles).to(tl.int32)
-    else:
-        pair = tl.program_id(0).to(tl.int64)
-        batch_head = tl.program_id(1).to(tl.int64)
-        tile = tl.program_id(2)
+    pair, batch_head, tile = _tile_indices(GROUPS=NT // 2, TILES=K // BK * NV)
     batch_index = batch_head // H
     head_index = batch_head % H
     key_tile = tile // NV
@@ -497,19 +452,8 @@ def _quad_states_kernel(
     BV: tl.constexpr,
     NV: tl.constexpr,
     STORE_STATES: tl.constexpr = True,
-    TILE_FIRST: tl.constexpr = False,
 ):
-    if TILE_FIRST:
-        tiles: tl.constexpr = K // BK * NV
-        groups: tl.constexpr = NT // 4
-        index = tl.program_id(0).to(tl.int64)
-        group = index // tiles % groups
-        batch_head = index // (tiles * groups)
-        tile = (index % tiles).to(tl.int32)
-    else:
-        group = tl.program_id(0).to(tl.int64)
-        batch_head = tl.program_id(1).to(tl.int64)
-        tile = tl.program_id(2)
+    group, batch_head, tile = _tile_indices(GROUPS=NT // 4, TILES=K // BK * NV)
     batch = batch_head // H
     head = batch_head % H
     key_tile = tile // NV
@@ -620,8 +564,6 @@ def _prepare_weights_kernel(
     NK: tl.constexpr,
     NUM_LEVELS: tl.constexpr,
     MAX_BLOCK: tl.constexpr,
-    WEIGHTED_SCORES: tl.constexpr,
-    PRECOMPUTE_QUERY: tl.constexpr,
 ):
     chunk = tl.program_id(0).to(tl.int64)
     batch_head = tl.program_id(1).to(tl.int64)
@@ -630,145 +572,30 @@ def _prepare_weights_kernel(
     rows = tl.arange(0, BLOCK_T)
     tokens = chunk * BLOCK_T + rows
     gates = tl.load(g + (batch * T + tokens) * H + head)
-    if WEIGHTED_SCORES:
-        columns = tl.arange(0, BLOCK_T)
-        levels = tl.load(level_lut + rows[:, None] * BLOCK_T + columns[None, :])
-        scales = tl.load(level_scales + ((batch * T + tokens[:, None]) * H + head) * L + levels).to(tl.float32)
-        factors = tl.exp(gates[:, None] - gates[None, :]) * scales
-        tile_offsets = rows[:, None] * BLOCK_T + columns[None, :]
-        for key_tile in tl.static_range(NK):
-            score_base = ((batch * NT + chunk) * NK + key_tile) * BLOCK_T * BLOCK_T
-            score = tl.load(scores + score_base + tile_offsets)
-            weighted = tl.where(rows[:, None] >= columns[None, :], score * factors, 0.0)
-            output_base = (((batch * NT + chunk) * H + head) * NK + key_tile) * BLOCK_T * BLOCK_T
-            tl.store(weighted_scores + output_base + tile_offsets, weighted.to(weighted_scores.dtype.element_ty))
-    if PRECOMPUTE_QUERY:
-        current_end = chunk - 1
-        later_decay = tl.zeros([], tl.float32)
-        for level in tl.static_range(NUM_LEVELS):
-            block_size = 1 << level
-            if chunk & block_size != 0:
-                scale = tl.load(level_scales + ((batch * T + tokens) * H + head) * L + 7 + level).to(tl.float32)
-                factor = scale * tl.exp(gates + later_decay)
-                factor_base = (((batch * NT + chunk) * H + head) * NUM_LEVELS + level) * BLOCK_T
-                tl.store(query_factors + factor_base + rows, factor)
-                offsets = tl.arange(0, MAX_BLOCK)
-                gate_offsets = (batch * NT + current_end - block_size + 1 + offsets) * H + head
-                later_decay += tl.sum(tl.load(chunk_gates + gate_offsets, offsets < block_size, 0.0), axis=0)
-                current_end -= block_size
-
-
-@triton.jit
-def _fused_reduce_output_kernel(
-    q,
-    k,
-    v,
-    g,
-    level_scales,
-    level_lut,
-    scores,
-    states,
-    chunk_gates,
-    output,
-    query_factors,
-    B: tl.constexpr,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    L: tl.constexpr,
-    NT: tl.constexpr,
-    NUM_LEVELS: tl.constexpr,
-    MAX_BLOCK: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    NK: tl.constexpr,
-    NV: tl.constexpr,
-    PRECOMPUTE_SCORES: tl.constexpr,
-    CACHE_STATES: tl.constexpr,
-    WEIGHTED_SCORES: tl.constexpr,
-    PRECOMPUTE_QUERY: tl.constexpr,
-    TILE_FIRST: tl.constexpr,
-):
-    accumulator = tl.zeros((BLOCK_T, BV), tl.float32)
+    columns = tl.arange(0, BLOCK_T)
+    levels = tl.load(level_lut + rows[:, None] * BLOCK_T + columns[None, :])
+    scales = tl.load(level_scales + ((batch * T + tokens[:, None]) * H + head) * L + levels).to(tl.float32)
+    factors = tl.exp(gates[:, None] - gates[None, :]) * scales
+    tile_offsets = rows[:, None] * BLOCK_T + columns[None, :]
     for key_tile in tl.static_range(NK):
-        local_output, query, gates = _local_fwd_kernel(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            level_scales=level_scales,
-            level_lut=level_lut,
-            local_output=None,
-            states=None,
-            chunk_gates=chunk_gates,
-            scores=scores,
-            cached_states=None,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            L=L,
-            NT=NT,
-            BK=BK,
-            BV=BV,
-            NK=NK,
-            NV=NV,
-            PRECOMPUTE_SCORES=PRECOMPUTE_SCORES,
-            CACHE_STATES=CACHE_STATES,
-            RETURN_TILE=True,
-            KEY_TILE=key_tile,
-            WEIGHTED_SCORES=WEIGHTED_SCORES,
-            TILE_FIRST=TILE_FIRST,
-        )
-        partial = _inter_fwd_kernel(
-            q=q,
-            g=g,
-            level_scales=level_scales,
-            local_output=None,
-            states=states,
-            chunk_gates=chunk_gates,
-            output=output,
-            B=B,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            L=L,
-            NT=NT,
-            NUM_LEVELS=NUM_LEVELS,
-            MAX_BLOCK=MAX_BLOCK,
-            BK=BK,
-            BV=BV,
-            NK=NK,
-            NV=NV,
-            CACHE_STATES=CACHE_STATES,
-            initial_output=local_output,
-            initial_q=query,
-            initial_g=gates,
-            query_factors=query_factors,
-            PRECOMPUTE_QUERY=PRECOMPUTE_QUERY,
-            TILE_FIRST=TILE_FIRST,
-            USE_INITIAL_TILES=True,
-            KEY_TILE=key_tile,
-            RETURN_TILE=True,
-        )
-        accumulator += partial.to(output.dtype.element_ty).to(tl.float32)
-    if TILE_FIRST:
-        index = tl.program_id(0).to(tl.int64)
-        chunk = index // NV % NT
-        batch_head = index // (NV * NT)
-        value_tile = (index % NV).to(tl.int32)
-    else:
-        chunk = tl.program_id(0).to(tl.int64)
-        batch_head = tl.program_id(1).to(tl.int64)
-        value_tile = tl.program_id(2)
-    batch = batch_head // H
-    head = batch_head % H
-    tokens = chunk * BLOCK_T + tl.arange(0, BLOCK_T)
-    values = value_tile * BV + tl.arange(0, BV)
-    offsets = ((batch * T + tokens[:, None]) * H + head) * V + values[None, :]
-    tl.store(output + offsets, accumulator.to(output.dtype.element_ty))
+        score_base = ((batch * NT + chunk) * NK + key_tile) * BLOCK_T * BLOCK_T
+        score = tl.load(scores + score_base + tile_offsets)
+        weighted = tl.where(rows[:, None] >= columns[None, :], score * factors, 0.0)
+        output_base = (((batch * NT + chunk) * H + head) * NK + key_tile) * BLOCK_T * BLOCK_T
+        tl.store(weighted_scores + output_base + tile_offsets, weighted.to(weighted_scores.dtype.element_ty))
+    current_end = chunk - 1
+    later_decay = tl.zeros([], tl.float32)
+    for level in tl.static_range(NUM_LEVELS):
+        block_size = 1 << level
+        if chunk & block_size != 0:
+            scale = tl.load(level_scales + ((batch * T + tokens) * H + head) * L + 7 + level).to(tl.float32)
+            factor = scale * tl.exp(gates + later_decay)
+            factor_base = (((batch * NT + chunk) * H + head) * NUM_LEVELS + level) * BLOCK_T
+            tl.store(query_factors + factor_base + rows, factor)
+            offsets = tl.arange(0, MAX_BLOCK)
+            gate_offsets = (batch * NT + current_end - block_size + 1 + offsets) * H + head
+            later_decay += tl.sum(tl.load(chunk_gates + gate_offsets, offsets < block_size, 0.0), axis=0)
+            current_end -= block_size
 
 
 @triton.jit
@@ -779,7 +606,7 @@ def _fused_output_kernel(
     g,
     level_scales,
     level_lut,
-    scores,
+    weighted_scores,
     states,
     chunk_gates,
     output,
@@ -797,11 +624,7 @@ def _fused_output_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
-    PRECOMPUTE_SCORES: tl.constexpr,
     CACHE_STATES: tl.constexpr,
-    WEIGHTED_SCORES: tl.constexpr,
-    PRECOMPUTE_QUERY: tl.constexpr,
-    TILE_FIRST: tl.constexpr,
 ):
     local_output, query, gates = _local_fwd_kernel(
         q=q,
@@ -813,7 +636,7 @@ def _fused_output_kernel(
         local_output=None,
         states=None,
         chunk_gates=chunk_gates,
-        scores=scores,
+        weighted_scores=weighted_scores,
         cached_states=None,
         T=T,
         H=H,
@@ -825,11 +648,8 @@ def _fused_output_kernel(
         BV=BV,
         NK=NK,
         NV=NV,
-        PRECOMPUTE_SCORES=PRECOMPUTE_SCORES,
         CACHE_STATES=CACHE_STATES,
         RETURN_TILE=True,
-        WEIGHTED_SCORES=WEIGHTED_SCORES,
-        TILE_FIRST=TILE_FIRST,
     )
     _inter_fwd_kernel(
         q=q,
@@ -857,7 +677,5 @@ def _fused_output_kernel(
         initial_q=query,
         initial_g=gates,
         query_factors=query_factors,
-        PRECOMPUTE_QUERY=PRECOMPUTE_QUERY,
-        TILE_FIRST=TILE_FIRST,
         USE_INITIAL_TILES=True,
     )

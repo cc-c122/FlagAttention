@@ -20,7 +20,6 @@ import triton
 
 from .kernels import (
     _fused_output_kernel,
-    _fused_reduce_output_kernel,
     _inter_fwd_kernel,
     _local_fwd_kernel,
     _merge_states_kernel,
@@ -109,33 +108,16 @@ def chunk_log_linear_attn(
     level_scales = level_scales.contiguous()
     num_chunks = sequence // CHUNK_SIZE
     cache_states = num_chunks > 1
-    fuse_forward = cache_states and num_chunks >= 4
-    fuse_quad_states = fuse_forward and num_chunks >= 8
-    first_level = 2 if fuse_quad_states else int(fuse_forward)
-    num_levels = max(1, math.ceil(math.log2(num_chunks)))
+    num_levels = max(1, num_chunks.bit_length() - 1)
+    first_level = min(2, num_levels - 1)
+    fuse_forward = first_level > 0
     state_levels = num_levels - int(cache_states)
     num_key_tiles = key_dim // BLOCK_KEY
     num_value_tiles = value_dim // BLOCK_VALUE
     num_tiles = num_key_tiles * num_value_tiles
-    tile_first = fuse_forward and num_tiles > 1
-    state_tile_first = tile_first and num_tiles >= 8
-    output_programs = batch * num_chunks * heads * num_tiles
-    precompute_scores = heads * num_value_tiles >= 16 and output_programs >= 4096
-    precompute_weighted = fuse_forward and precompute_scores and (num_value_tiles > 1)
-    precompute_query = fuse_forward and output_programs >= 4096
-    fuse_reduction = precompute_weighted and precompute_query and (num_key_tiles == 2)
-    local_g = _chunk_local_cumsum(g=g.contiguous())
+    local_g = _chunk_local_cumsum(g=g)
     level_lut = _level_lut(device_index=q.device.index or 0)
-    partial_shape = (batch, sequence, heads, num_key_tiles, value_dim)
-    if fuse_reduction:
-        local_output = None
-        output = torch.empty_like(v)
-        output_partial = output
-    else:
-        local_output = torch.empty(partial_shape, device=v.device, dtype=v.dtype)
-        output_partial = local_output
-        output = output_partial.squeeze(3) if num_key_tiles == 1 else torch.empty_like(v)
-    state_nodes = max(1, 2 * num_chunks - 2)
+    state_nodes = 1
     if cache_states:
         first_nodes = num_chunks >> first_level
         state_nodes = first_nodes + (first_nodes // 2 if state_levels > first_level + 1 else 0)
@@ -148,48 +130,20 @@ def chunk_log_linear_attn(
         else None
     )
     chunk_gates = torch.empty(batch, num_chunks, heads, device=v.device, dtype=torch.float32)
-    scores = (
-        torch.empty(batch, num_chunks, num_key_tiles, CHUNK_SIZE, CHUNK_SIZE, device=q.device, dtype=torch.float32)
-        if precompute_scores
-        else None
-    )
-    weighted_scores = (
-        torch.empty(batch, num_chunks, heads, num_key_tiles, CHUNK_SIZE, CHUNK_SIZE, device=q.device, dtype=q.dtype)
-        if precompute_weighted
-        else None
-    )
-    query_factors = (
-        torch.empty(batch, num_chunks, heads, num_levels, CHUNK_SIZE, device=q.device, dtype=torch.float32)
-        if precompute_query
-        else None
-    )
-    state_kernel = _quad_states_kernel if fuse_quad_states else _paired_states_kernel
-    output_kernel = _fused_reduce_output_kernel if fuse_reduction else _fused_output_kernel
-    output_tiles = num_value_tiles if fuse_reduction else num_tiles
-    output_grid = (
-        (num_chunks * batch * heads * output_tiles,) if tile_first else (num_chunks, batch * heads, output_tiles)
-    )
-    state_grid = (
-        ((num_chunks >> first_level) * batch * heads * num_tiles,)
-        if state_tile_first
-        else (num_chunks >> first_level, batch * heads, num_tiles)
-    )
-    if precompute_scores:
-        _scores_kernel[num_chunks, batch, num_key_tiles](
-            q=q, k=k, scores=scores, T=sequence, K=key_dim, NT=num_chunks, NK=num_key_tiles, BK=BLOCK_KEY, num_warps=4
-        )
+    output_grid = (num_chunks * batch * heads * num_tiles,)
     if not fuse_forward:
-        _local_fwd_kernel[num_chunks, batch * heads, num_tiles](
+        output_partial = torch.empty((batch, sequence, heads, num_key_tiles, value_dim), device=v.device, dtype=v.dtype)
+        _local_fwd_kernel[output_grid](
             q=q,
             k=k,
             v=v,
             g=local_g,
             level_scales=level_scales,
             level_lut=level_lut,
-            local_output=local_output,
+            local_output=output_partial,
             states=states,
             chunk_gates=chunk_gates,
-            scores=scores,
+            weighted_scores=None,
             cached_states=cached_states,
             T=sequence,
             H=heads,
@@ -201,12 +155,13 @@ def chunk_log_linear_attn(
             BV=BLOCK_VALUE,
             NK=num_key_tiles,
             NV=num_value_tiles,
-            PRECOMPUTE_SCORES=precompute_scores,
             CACHE_STATES=cache_states,
             num_warps=4,
             num_stages=2,
         )
-    if fuse_forward:
+    else:
+        state_kernel = _quad_states_kernel if first_level == 2 else _paired_states_kernel
+        state_grid = ((num_chunks >> first_level) * batch * heads * num_tiles,)
         state_kernel[state_grid](
             k=k,
             v=v,
@@ -224,7 +179,6 @@ def chunk_log_linear_attn(
             BV=BLOCK_VALUE,
             NV=num_value_tiles,
             STORE_STATES=first_level < state_levels,
-            TILE_FIRST=state_tile_first,
             num_warps=4,
             num_stages=2,
         )
@@ -233,9 +187,7 @@ def chunk_log_linear_attn(
         half = block >> 1
         store_states = level < state_levels
         merge_nodes = num_chunks // block if store_states else num_chunks // (2 * block)
-        merge_grid = (
-            (merge_nodes * batch * heads * num_tiles,) if state_tile_first else (merge_nodes, batch * heads, num_tiles)
-        )
+        merge_grid = (merge_nodes * batch * heads * num_tiles,)
         _merge_states_kernel[merge_grid](
             states=states,
             cached_states=cached_states,
@@ -254,11 +206,36 @@ def chunk_log_linear_attn(
             CACHE_STATES=cache_states,
             FIRST_LEVEL=first_level,
             STORE_STATES=store_states,
-            TILE_FIRST=state_tile_first,
             num_warps=4,
             num_stages=2,
         )
-    if precompute_weighted or precompute_query:
+    precompute_weights = False
+    if fuse_forward:
+        score_tiles = batch * num_chunks * num_key_tiles
+        score_elements = score_tiles * CHUNK_SIZE**2
+        score_bytes = score_elements * g.element_size()
+        weighted_score_bytes = score_elements * heads * q.element_size()
+        query_factor_bytes = g.nbytes * num_levels
+        precompute_weights = (
+            heads > 1
+            and num_value_tiles > 1
+            and score_bytes + weighted_score_bytes + query_factor_bytes <= states.nbytes
+            and score_tiles >= torch.cuda.get_device_properties(q.device).multi_processor_count
+        )
+        del states
+    if precompute_weights:
+        scores = torch.empty(
+            batch, num_chunks, num_key_tiles, CHUNK_SIZE, CHUNK_SIZE, device=q.device, dtype=torch.float32
+        )
+        _scores_kernel[num_chunks, batch, num_key_tiles](
+            q=q, k=k, scores=scores, T=sequence, K=key_dim, NT=num_chunks, NK=num_key_tiles, BK=BLOCK_KEY, num_warps=4
+        )
+        weighted_scores = torch.empty(
+            batch, num_chunks, heads, num_key_tiles, CHUNK_SIZE, CHUNK_SIZE, device=q.device, dtype=q.dtype
+        )
+        query_factors = torch.empty(
+            batch, num_chunks, heads, num_levels, CHUNK_SIZE, device=q.device, dtype=torch.float32
+        )
         _prepare_weights_kernel[num_chunks, batch * heads](
             g=local_g,
             level_scales=level_scales,
@@ -274,20 +251,22 @@ def chunk_log_linear_attn(
             NK=num_key_tiles,
             NUM_LEVELS=num_levels,
             MAX_BLOCK=1 << (num_levels - 1),
-            WEIGHTED_SCORES=precompute_weighted,
-            PRECOMPUTE_QUERY=precompute_query,
             num_warps=4,
             num_stages=2,
         )
+        del scores
+    else:
+        weighted_scores = query_factors = None
     if fuse_forward:
-        output_kernel[output_grid](
+        output_partial = torch.empty((batch, sequence, heads, num_key_tiles, value_dim), device=v.device, dtype=v.dtype)
+        _fused_output_kernel[output_grid](
             q=q,
             k=k,
             v=v,
             g=local_g,
             level_scales=level_scales,
             level_lut=level_lut,
-            scores=weighted_scores if precompute_weighted else scores,
+            weighted_scores=weighted_scores,
             states=cached_states,
             chunk_gates=chunk_gates,
             output=output_partial,
@@ -305,20 +284,16 @@ def chunk_log_linear_attn(
             BV=BLOCK_VALUE,
             NK=num_key_tiles,
             NV=num_value_tiles,
-            PRECOMPUTE_SCORES=precompute_scores,
             CACHE_STATES=cache_states,
-            WEIGHTED_SCORES=precompute_weighted,
-            PRECOMPUTE_QUERY=precompute_query,
-            TILE_FIRST=tile_first,
             num_warps=4,
             num_stages=2,
         )
     else:
-        _inter_fwd_kernel[num_chunks, batch * heads, num_tiles](
+        _inter_fwd_kernel[output_grid](
             q=q,
             g=local_g,
             level_scales=level_scales,
-            local_output=local_output,
+            local_output=output_partial,
             states=cached_states if cache_states else states,
             chunk_gates=chunk_gates,
             output=output_partial,
@@ -339,14 +314,17 @@ def chunk_log_linear_attn(
             num_warps=4,
             num_stages=2,
         )
-    if num_key_tiles > 1 and (not fuse_reduction):
-        _reduce_output_flat_kernel[triton.cdiv(batch * sequence * heads * value_dim, REDUCTION_BLOCK),](
-            partial=output_partial,
-            output=output,
-            N=batch * sequence * heads * value_dim,
-            V=value_dim,
-            NK=num_key_tiles,
-            BLOCK=REDUCTION_BLOCK,
-            num_warps=4,
-        )
+    del cached_states, weighted_scores, query_factors
+    if num_key_tiles == 1:
+        return output_partial.squeeze(3)
+    output = torch.empty_like(v)
+    _reduce_output_flat_kernel[triton.cdiv(batch * sequence * heads * value_dim, REDUCTION_BLOCK),](
+        partial=output_partial,
+        output=output,
+        N=batch * sequence * heads * value_dim,
+        V=value_dim,
+        NK=num_key_tiles,
+        BLOCK=REDUCTION_BLOCK,
+        num_warps=4,
+    )
     return output
