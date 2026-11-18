@@ -54,9 +54,7 @@ def _local_fwd_kernel(
     level_scales,
     level_lut,
     local_output,
-    states,
     chunk_gates,
-    weighted_scores,
     cached_states,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -68,7 +66,6 @@ def _local_fwd_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
-    CACHE_STATES: tl.constexpr,
     RETURN_TILE: tl.constexpr = False,
 ):
     chunk_index, batch_head, tile_index = _tile_indices(GROUPS=NT, TILES=NK * NV)
@@ -88,20 +85,15 @@ def _local_fwd_kernel(
     b_g = tl.load(g + (batch_index * T + token_offsets) * H + head_index)
     row = offsets_t[:, None]
     col = offsets_t[None, :]
-    if weighted_scores is not None:
-        score_base = (((batch_index * NT + chunk_index) * H + head_index) * NK + key_tile) * BLOCK_T * BLOCK_T
-        b_score = tl.load(weighted_scores + score_base + row * BLOCK_T + col)
-    else:
-        b_level = tl.load(level_lut + row * BLOCK_T + col)
-        scale_ptrs = level_scales + ((batch_index * T + token_offsets[:, None]) * H + head_index) * L + b_level
-        b_level_scale = tl.load(scale_ptrs).to(tl.float32)
-        b_q = tl.load(q_ptrs).to(tl.float32)
-        b_score = tl.dot(b_q.to(q.dtype.element_ty), tl.trans(b_k.to(k.dtype.element_ty)))
-        b_score *= tl.exp(b_g[:, None] - b_g[None, :]) * b_level_scale
-        b_score = tl.where(row >= col, b_score, 0.0)
+    b_level = tl.load(level_lut + row * BLOCK_T + col)
+    scale_ptrs = level_scales + ((batch_index * T + token_offsets[:, None]) * H + head_index) * L + b_level
+    b_level_scale = tl.load(scale_ptrs).to(tl.float32)
+    b_q = tl.load(q_ptrs).to(tl.float32)
+    b_score = tl.dot(b_q.to(q.dtype.element_ty), tl.trans(b_k.to(k.dtype.element_ty)))
+    b_score *= tl.exp(b_g[:, None] - b_g[None, :]) * b_level_scale
+    b_score = tl.where(row >= col, b_score, 0.0)
     b_output = tl.dot(b_score.to(v.dtype.element_ty), b_v.to(v.dtype.element_ty))
     if RETURN_TILE:
-        b_q = tl.load(q_ptrs).to(tl.float32)
         return (b_output.to(v.dtype.element_ty).to(tl.float32), b_q, b_g)
     else:
         output_ptrs = (
@@ -110,23 +102,19 @@ def _local_fwd_kernel(
             + offsets_v[None, :]
         )
         tl.store(output_ptrs, b_output.to(local_output.dtype.element_ty))
-        gate_last = tl.load(g + (batch_index * T + chunk_index * BLOCK_T + BLOCK_T - 1) * H + head_index)
-        b_v_scaled = b_v * tl.exp(gate_last - b_g)[:, None]
-        b_state = tl.dot(tl.trans(b_k.to(k.dtype.element_ty)), b_v_scaled.to(v.dtype.element_ty))
-        state_base = (
-            ((batch_index * NT + chunk_index) * H + head_index) * K * V + offsets_k[:, None] * V + offsets_v[None, :]
-        )
-        tl.store(states + state_base, b_state)
-        if CACHE_STATES:
-            if NT > 1 and chunk_index % 2 == 0:
+        if NT > 1:
+            gate_last = tl.load(g + (batch_index * T + chunk_index * BLOCK_T + BLOCK_T - 1) * H + head_index)
+            if chunk_index % 2 == 0:
+                b_v_scaled = b_v * tl.exp(gate_last - b_g)[:, None]
+                b_state = tl.dot(tl.trans(b_k.to(k.dtype.element_ty)), b_v_scaled.to(v.dtype.element_ty))
                 cache_base = (
                     ((batch_index * (NT // 2) + chunk_index // 2) * H + head_index) * K * V
                     + offsets_k[:, None] * V
                     + offsets_v[None, :]
                 )
                 tl.store(cached_states + cache_base, b_state.to(cached_states.dtype.element_ty))
-        if key_tile == 0 and value_tile == 0:
-            tl.store(chunk_gates + (batch_index * NT + chunk_index) * H + head_index, gate_last)
+            if key_tile == 0 and value_tile == 0:
+                tl.store(chunk_gates + (batch_index * NT + chunk_index) * H + head_index, gate_last)
 
 
 @triton.jit
@@ -220,6 +208,32 @@ def _merge_states_kernel(
 
 
 @triton.jit
+def _query_factor_base(
+    batch, chunk, head, LEVEL: tl.constexpr, H: tl.constexpr, NT: tl.constexpr, NUM_LEVELS: tl.constexpr
+):
+    rank = ((chunk >> (LEVEL + 1)) << LEVEL) + (chunk & ((1 << LEVEL) - 1))
+    return (((batch * NUM_LEVELS + LEVEL) * (NT // 2) + rank) * H + head) * BLOCK_T
+
+
+@triton.jit
+def _cached_state_base(
+    batch,
+    head,
+    end,
+    LEVEL: tl.constexpr,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    NT: tl.constexpr,
+):
+    nodes = NT >> (LEVEL + 1)
+    node = end >> (LEVEL + 1)
+    level_base = tl.full((), NT - (NT >> LEVEL), tl.int64) * B * H * K * V
+    return level_base + ((batch * nodes + node) * H + head) * K * V
+
+
+@triton.jit
 def _inter_fwd_kernel(
     q,
     g,
@@ -241,12 +255,10 @@ def _inter_fwd_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
-    CACHE_STATES: tl.constexpr,
     initial_output=None,
     initial_q=None,
     initial_g=None,
     USE_INITIAL_TILES: tl.constexpr = False,
-    query_factors=None,
 ):
     chunk_index, batch_head, tile_index = _tile_indices(GROUPS=NT, TILES=NK * NV)
     key_tile = tile_index // NV
@@ -276,36 +288,18 @@ def _inter_fwd_kernel(
     for level in tl.static_range(NUM_LEVELS):
         block_size = 1 << level
         if chunk_index & block_size != 0:
-            if CACHE_STATES:
-                level_nodes = NT >> level + 1
-                level_base = tl.full((), NT - (NT >> level), tl.int64) * B * H * K * V
-                state_node = current_end >> level + 1
-            else:
-                level_nodes = NT >> level
-                level_base = tl.full((), 2 * NT - 2 * level_nodes, tl.int64) * B * H * K * V
-                state_node = current_end >> level
-            state_base = (
-                level_base
-                + ((batch_index * level_nodes + state_node) * H + head_index) * K * V
-                + offsets_k[:, None] * V
-                + offsets_v[None, :]
+            state_base = _cached_state_base(
+                batch=batch_index, head=head_index, end=current_end, LEVEL=level, B=B, H=H, K=K, V=V, NT=NT
             )
+            state_base += offsets_k[:, None] * V + offsets_v[None, :]
             b_state = tl.load(states + state_base)
-            if query_factors is not None:
-                factor_base = (((batch_index * NT + chunk_index) * H + head_index) * NUM_LEVELS + level) * BLOCK_T
-                query_factor = tl.load(query_factors + factor_base + offsets_t)
-                b_q_scaled = b_q * query_factor[:, None]
-            else:
-                scale_ptrs = level_scales + ((batch_index * T + token_offsets) * H + head_index) * L + 7 + level
-                b_scale = tl.load(scale_ptrs).to(tl.float32)
-                b_q_scaled = b_q * (b_scale * tl.exp(b_g + later_decay))[:, None]
+            scale_ptrs = level_scales + ((batch_index * T + token_offsets) * H + head_index) * L + 7 + level
+            b_scale = tl.load(scale_ptrs).to(tl.float32)
+            b_q_scaled = b_q * (b_scale * tl.exp(b_g + later_decay))[:, None]
             b_output += tl.dot(b_q_scaled.to(q.dtype.element_ty), b_state.to(q.dtype.element_ty))
-            if query_factors is None:
-                offsets_chunk = tl.arange(0, MAX_BLOCK)
-                gate_ptrs = (
-                    chunk_gates + (batch_index * NT + current_end - block_size + 1 + offsets_chunk) * H + head_index
-                )
-                later_decay += tl.sum(tl.load(gate_ptrs, mask=offsets_chunk < block_size, other=0.0), axis=0)
+            offsets_chunk = tl.arange(0, MAX_BLOCK)
+            gate_ptrs = chunk_gates + (batch_index * NT + current_end - block_size + 1 + offsets_chunk) * H + head_index
+            later_decay += tl.sum(tl.load(gate_ptrs, mask=offsets_chunk < block_size, other=0.0), axis=0)
             current_end -= block_size
     output_ptrs = (
         output
@@ -549,19 +543,15 @@ def _quad_states_kernel(
 
 
 @triton.jit
-def _prepare_weights_kernel(
+def _prepare_query_factors_kernel(
     g,
     level_scales,
-    level_lut,
-    scores,
     chunk_gates,
-    weighted_scores,
     query_factors,
     T: tl.constexpr,
     H: tl.constexpr,
     L: tl.constexpr,
     NT: tl.constexpr,
-    NK: tl.constexpr,
     NUM_LEVELS: tl.constexpr,
     MAX_BLOCK: tl.constexpr,
 ):
@@ -572,17 +562,6 @@ def _prepare_weights_kernel(
     rows = tl.arange(0, BLOCK_T)
     tokens = chunk * BLOCK_T + rows
     gates = tl.load(g + (batch * T + tokens) * H + head)
-    columns = tl.arange(0, BLOCK_T)
-    levels = tl.load(level_lut + rows[:, None] * BLOCK_T + columns[None, :])
-    scales = tl.load(level_scales + ((batch * T + tokens[:, None]) * H + head) * L + levels).to(tl.float32)
-    factors = tl.exp(gates[:, None] - gates[None, :]) * scales
-    tile_offsets = rows[:, None] * BLOCK_T + columns[None, :]
-    for key_tile in tl.static_range(NK):
-        score_base = ((batch * NT + chunk) * NK + key_tile) * BLOCK_T * BLOCK_T
-        score = tl.load(scores + score_base + tile_offsets)
-        weighted = tl.where(rows[:, None] >= columns[None, :], score * factors, 0.0)
-        output_base = (((batch * NT + chunk) * H + head) * NK + key_tile) * BLOCK_T * BLOCK_T
-        tl.store(weighted_scores + output_base + tile_offsets, weighted.to(weighted_scores.dtype.element_ty))
     current_end = chunk - 1
     later_decay = tl.zeros([], tl.float32)
     for level in tl.static_range(NUM_LEVELS):
@@ -590,7 +569,9 @@ def _prepare_weights_kernel(
         if chunk & block_size != 0:
             scale = tl.load(level_scales + ((batch * T + tokens) * H + head) * L + 7 + level).to(tl.float32)
             factor = scale * tl.exp(gates + later_decay)
-            factor_base = (((batch * NT + chunk) * H + head) * NUM_LEVELS + level) * BLOCK_T
+            factor_base = _query_factor_base(
+                batch=batch, chunk=chunk, head=head, LEVEL=level, H=H, NT=NT, NUM_LEVELS=NUM_LEVELS
+            )
             tl.store(query_factors + factor_base + rows, factor)
             offsets = tl.arange(0, MAX_BLOCK)
             gate_offsets = (batch * NT + current_end - block_size + 1 + offsets) * H + head
@@ -606,11 +587,9 @@ def _fused_output_kernel(
     g,
     level_scales,
     level_lut,
-    weighted_scores,
     states,
     chunk_gates,
     output,
-    query_factors,
     B: tl.constexpr,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -624,7 +603,6 @@ def _fused_output_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
-    CACHE_STATES: tl.constexpr,
 ):
     local_output, query, gates = _local_fwd_kernel(
         q=q,
@@ -634,9 +612,7 @@ def _fused_output_kernel(
         level_scales=level_scales,
         level_lut=level_lut,
         local_output=None,
-        states=None,
         chunk_gates=chunk_gates,
-        weighted_scores=weighted_scores,
         cached_states=None,
         T=T,
         H=H,
@@ -648,7 +624,6 @@ def _fused_output_kernel(
         BV=BV,
         NK=NK,
         NV=NV,
-        CACHE_STATES=CACHE_STATES,
         RETURN_TILE=True,
     )
     _inter_fwd_kernel(
@@ -672,10 +647,95 @@ def _fused_output_kernel(
         BV=BV,
         NK=NK,
         NV=NV,
-        CACHE_STATES=CACHE_STATES,
         initial_output=local_output,
         initial_q=query,
         initial_g=gates,
-        query_factors=query_factors,
         USE_INITIAL_TILES=True,
     )
+
+
+@triton.jit
+def _shared_score_output_kernel(
+    q,
+    k,
+    v,
+    g,
+    level_scales,
+    level_lut,
+    scores,
+    states,
+    chunk_gates,
+    output,
+    query_factors,
+    B: tl.constexpr,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    L: tl.constexpr,
+    NT: tl.constexpr,
+    NUM_LEVELS: tl.constexpr,
+    MAX_BLOCK: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NK: tl.constexpr,
+    NV: tl.constexpr,
+):
+    index = tl.program_id(0).to(tl.int64)
+    key_tile = (index % NK).to(tl.int32)
+    head = (index // NK) % H
+    chunk = (index // (NK * H)) % NT
+    batch = index // (NK * H * NT)
+    rows = tl.arange(0, BLOCK_T)
+    cols = tl.arange(0, BLOCK_T)
+    tokens = chunk * BLOCK_T + rows
+    keys = key_tile * BK + tl.arange(0, BK)
+    query = tl.load(q + (batch * T + tokens[:, None]) * K + keys[None, :]).to(tl.float32)
+    gates = tl.load(g + (batch * T + tokens) * H + head)
+    tile_offsets = rows[:, None] * BLOCK_T + cols[None, :]
+    levels = tl.load(level_lut + tile_offsets)
+    scales = tl.load(level_scales + ((batch * T + tokens[:, None]) * H + head) * L + levels).to(tl.float32)
+    factors = tl.exp(gates[:, None] - gates[None, :]) * scales
+    if scores is None:
+        key = tl.load(k + (batch * T + tokens[:, None]) * K + keys[None, :])
+        score = tl.dot(query.to(q.dtype.element_ty), tl.trans(key))
+    else:
+        score_base = ((batch * NT + chunk) * NK + key_tile) * BLOCK_T * BLOCK_T
+        score = tl.load(scores + score_base + tile_offsets)
+    weighted = tl.where(rows[:, None] >= cols[None, :], score * factors, 0.0).to(v.dtype.element_ty)
+    accumulators = ()
+    for value_tile in tl.static_range(NV):
+        columns = value_tile * BV + tl.arange(0, BV)
+        values = tl.load(v + ((batch * T + tokens[:, None]) * H + head) * V + columns[None, :])
+        partial = tl.dot(weighted, values).to(v.dtype.element_ty).to(tl.float32)
+        accumulators += (partial,)
+    end = chunk - 1
+    later_decay = tl.zeros([], tl.float32)
+    for level in tl.static_range(NUM_LEVELS):
+        if chunk & (1 << level) != 0:
+            if query_factors is None:
+                scale = tl.load(level_scales + ((batch * T + tokens) * H + head) * L + 7 + level).to(tl.float32)
+                query_factor = scale * tl.exp(gates + later_decay)
+            else:
+                base = _query_factor_base(
+                    batch=batch, chunk=chunk, head=head, LEVEL=level, H=H, NT=NT, NUM_LEVELS=NUM_LEVELS
+                )
+                query_factor = tl.load(query_factors + base + rows)
+            scaled = (query * query_factor[:, None]).to(q.dtype.element_ty)
+            state_base = _cached_state_base(batch=batch, head=head, end=end, LEVEL=level, B=B, H=H, K=K, V=V, NT=NT)
+            updated = ()
+            for value_tile in tl.static_range(NV):
+                columns = value_tile * BV + tl.arange(0, BV)
+                state = tl.load(states + state_base + keys[:, None] * V + columns[None, :])
+                updated += (accumulators[value_tile] + tl.dot(scaled, state),)
+            accumulators = updated
+            block_size = 1 << level
+            if query_factors is None:
+                offsets = tl.arange(0, MAX_BLOCK)
+                gate_offsets = (batch * NT + end - block_size + 1 + offsets) * H + head
+                later_decay += tl.sum(tl.load(chunk_gates + gate_offsets, mask=offsets < block_size, other=0.0), axis=0)
+            end -= block_size
+    for value_tile in tl.static_range(NV):
+        columns = value_tile * BV + tl.arange(0, BV)
+        dst = (((batch * T + tokens[:, None]) * H + head) * NK + key_tile) * V + columns[None, :]
+        tl.store(output + dst, accumulators[value_tile].to(output.dtype.element_ty))

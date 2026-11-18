@@ -24,10 +24,11 @@ from .kernels import (
     _local_fwd_kernel,
     _merge_states_kernel,
     _paired_states_kernel,
-    _prepare_weights_kernel,
+    _prepare_query_factors_kernel,
     _quad_states_kernel,
     _reduce_output_flat_kernel,
     _scores_kernel,
+    _shared_score_output_kernel,
 )
 
 CHUNK_SIZE = 64
@@ -117,19 +118,20 @@ def chunk_log_linear_attn(
     num_tiles = num_key_tiles * num_value_tiles
     local_g = _chunk_local_cumsum(g=g)
     level_lut = _level_lut(device_index=q.device.index or 0)
-    state_nodes = 1
+    states = cached_states = chunk_gates = None
     if cache_states:
-        first_nodes = num_chunks >> first_level
-        state_nodes = first_nodes + (first_nodes // 2 if state_levels > first_level + 1 else 0)
-        if fuse_forward and state_levels <= first_level:
-            state_nodes = 0
-    states = torch.empty(state_nodes * batch * heads * key_dim * value_dim, device=v.device, dtype=torch.float32)
-    cached_states = (
-        torch.empty((num_chunks - 1) * batch * heads * key_dim * value_dim, device=v.device, dtype=torch.bfloat16)
-        if cache_states
-        else None
-    )
-    chunk_gates = torch.empty(batch, num_chunks, heads, device=v.device, dtype=torch.float32)
+        if fuse_forward:
+            first_nodes = num_chunks >> first_level
+            state_nodes = first_nodes + (first_nodes // 2 if state_levels > first_level + 1 else 0)
+            if state_levels <= first_level:
+                state_nodes = 0
+            states = torch.empty(
+                state_nodes * batch * heads * key_dim * value_dim, device=v.device, dtype=torch.float32
+            )
+        cached_states = torch.empty(
+            (num_chunks - 1) * batch * heads * key_dim * value_dim, device=v.device, dtype=torch.bfloat16
+        )
+        chunk_gates = torch.empty(batch, num_chunks, heads, device=v.device, dtype=torch.float32)
     output_grid = (num_chunks * batch * heads * num_tiles,)
     if not fuse_forward:
         output_partial = torch.empty((batch, sequence, heads, num_key_tiles, value_dim), device=v.device, dtype=v.dtype)
@@ -141,9 +143,7 @@ def chunk_log_linear_attn(
             level_scales=level_scales,
             level_lut=level_lut,
             local_output=output_partial,
-            states=states,
             chunk_gates=chunk_gates,
-            weighted_scores=None,
             cached_states=cached_states,
             T=sequence,
             H=heads,
@@ -155,7 +155,6 @@ def chunk_log_linear_attn(
             BV=BLOCK_VALUE,
             NK=num_key_tiles,
             NV=num_value_tiles,
-            CACHE_STATES=cache_states,
             num_warps=4,
             num_stages=2,
         )
@@ -209,92 +208,112 @@ def chunk_log_linear_attn(
             num_warps=4,
             num_stages=2,
         )
-    precompute_weights = False
+    shared_grid_size = batch * num_chunks * heads * num_key_tiles
+    share_value_tiles = False
+    if fuse_forward and num_value_tiles > 1:
+        compute_units = torch.cuda.get_device_properties(q.device).multi_processor_count
+        if num_key_tiles == 1:
+            share_value_tiles = shared_grid_size >= compute_units
+        else:
+            score_tiles = batch * num_chunks * num_key_tiles
+            score_bytes = score_tiles * CHUNK_SIZE**2 * g.element_size()
+            query_factor_bytes = g.nbytes * num_levels // 2
+            share_value_tiles = (
+                heads > 1 and score_tiles >= compute_units and score_bytes + query_factor_bytes <= states.nbytes
+            )
     if fuse_forward:
-        score_tiles = batch * num_chunks * num_key_tiles
-        score_elements = score_tiles * CHUNK_SIZE**2
-        score_bytes = score_elements * g.element_size()
-        weighted_score_bytes = score_elements * heads * q.element_size()
-        query_factor_bytes = g.nbytes * num_levels
-        precompute_weights = (
-            heads > 1
-            and num_value_tiles > 1
-            and score_bytes + weighted_score_bytes + query_factor_bytes <= states.nbytes
-            and score_tiles >= torch.cuda.get_device_properties(q.device).multi_processor_count
-        )
         del states
-    if precompute_weights:
+    if share_value_tiles and num_key_tiles > 1:
         scores = torch.empty(
             batch, num_chunks, num_key_tiles, CHUNK_SIZE, CHUNK_SIZE, device=q.device, dtype=torch.float32
         )
         _scores_kernel[num_chunks, batch, num_key_tiles](
             q=q, k=k, scores=scores, T=sequence, K=key_dim, NT=num_chunks, NK=num_key_tiles, BK=BLOCK_KEY, num_warps=4
         )
-        weighted_scores = torch.empty(
-            batch, num_chunks, heads, num_key_tiles, CHUNK_SIZE, CHUNK_SIZE, device=q.device, dtype=q.dtype
-        )
         query_factors = torch.empty(
-            batch, num_chunks, heads, num_levels, CHUNK_SIZE, device=q.device, dtype=torch.float32
+            batch, num_levels, num_chunks // 2, heads, CHUNK_SIZE, device=q.device, dtype=torch.float32
         )
-        _prepare_weights_kernel[num_chunks, batch * heads](
+        _prepare_query_factors_kernel[num_chunks, batch * heads](
             g=local_g,
             level_scales=level_scales,
-            level_lut=level_lut,
-            scores=scores,
             chunk_gates=chunk_gates,
-            weighted_scores=weighted_scores,
             query_factors=query_factors,
             T=sequence,
             H=heads,
             L=levels,
             NT=num_chunks,
-            NK=num_key_tiles,
             NUM_LEVELS=num_levels,
             MAX_BLOCK=1 << (num_levels - 1),
             num_warps=4,
             num_stages=2,
         )
-        del scores
     else:
-        weighted_scores = query_factors = None
+        scores = query_factors = None
     if fuse_forward:
         output_partial = torch.empty((batch, sequence, heads, num_key_tiles, value_dim), device=v.device, dtype=v.dtype)
-        _fused_output_kernel[output_grid](
-            q=q,
-            k=k,
-            v=v,
-            g=local_g,
-            level_scales=level_scales,
-            level_lut=level_lut,
-            weighted_scores=weighted_scores,
-            states=cached_states,
-            chunk_gates=chunk_gates,
-            output=output_partial,
-            query_factors=query_factors,
-            B=batch,
-            T=sequence,
-            H=heads,
-            K=key_dim,
-            V=value_dim,
-            L=levels,
-            NT=num_chunks,
-            NUM_LEVELS=num_levels,
-            MAX_BLOCK=1 << (num_levels - 1),
-            BK=BLOCK_KEY,
-            BV=BLOCK_VALUE,
-            NK=num_key_tiles,
-            NV=num_value_tiles,
-            CACHE_STATES=cache_states,
-            num_warps=4,
-            num_stages=2,
-        )
-    else:
+        if share_value_tiles:
+            _shared_score_output_kernel[shared_grid_size,](
+                q=q,
+                k=k,
+                v=v,
+                g=local_g,
+                level_scales=level_scales,
+                level_lut=level_lut,
+                scores=scores,
+                states=cached_states,
+                chunk_gates=chunk_gates,
+                output=output_partial,
+                query_factors=query_factors,
+                B=batch,
+                T=sequence,
+                H=heads,
+                K=key_dim,
+                V=value_dim,
+                L=levels,
+                NT=num_chunks,
+                NUM_LEVELS=num_levels,
+                MAX_BLOCK=1 << (num_levels - 1),
+                BK=BLOCK_KEY,
+                BV=BLOCK_VALUE,
+                NK=num_key_tiles,
+                NV=num_value_tiles,
+                num_warps=4,
+                num_stages=2,
+            )
+        else:
+            _fused_output_kernel[output_grid](
+                q=q,
+                k=k,
+                v=v,
+                g=local_g,
+                level_scales=level_scales,
+                level_lut=level_lut,
+                states=cached_states,
+                chunk_gates=chunk_gates,
+                output=output_partial,
+                B=batch,
+                T=sequence,
+                H=heads,
+                K=key_dim,
+                V=value_dim,
+                L=levels,
+                NT=num_chunks,
+                NUM_LEVELS=num_levels,
+                MAX_BLOCK=1 << (num_levels - 1),
+                BK=BLOCK_KEY,
+                BV=BLOCK_VALUE,
+                NK=num_key_tiles,
+                NV=num_value_tiles,
+                num_warps=4,
+                num_stages=2,
+            )
+    elif cache_states:
         _inter_fwd_kernel[output_grid](
             q=q,
             g=local_g,
             level_scales=level_scales,
             local_output=output_partial,
-            states=cached_states if cache_states else states,
+            states=cached_states,
             chunk_gates=chunk_gates,
             output=output_partial,
             B=batch,
@@ -310,11 +329,10 @@ def chunk_log_linear_attn(
             BV=BLOCK_VALUE,
             NK=num_key_tiles,
             NV=num_value_tiles,
-            CACHE_STATES=cache_states,
             num_warps=4,
             num_stages=2,
         )
-    del cached_states, weighted_scores, query_factors
+    del cached_states, scores, query_factors
     if num_key_tiles == 1:
         return output_partial.squeeze(3)
     output = torch.empty_like(v)
