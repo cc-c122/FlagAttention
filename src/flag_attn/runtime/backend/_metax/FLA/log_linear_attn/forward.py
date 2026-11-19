@@ -101,12 +101,65 @@ def _validate_inputs(
 def chunk_log_linear_attn(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, level_scales: torch.Tensor
 ) -> torch.Tensor:
-    batch, sequence, heads, key_dim, value_dim, levels = _validate_inputs(q=q, k=k, v=v, g=g, level_scales=level_scales)
+    batch, sequence, _, key_dim, _, _ = _validate_inputs(q=q, k=k, v=v, g=g, level_scales=level_scales)
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
     g = g.contiguous()
     level_scales = level_scales.contiguous()
+    if batch > 1 and sequence > 2 * CHUNK_SIZE and key_dim // BLOCK_KEY > 2:
+        group_size = _batch_group_size(v=v, g=g, key_dim=key_dim)
+        if group_size < batch:
+            output = torch.empty_like(v)
+            for start in range(0, batch, group_size):
+                group = slice(start, start + group_size)
+                _chunk_forward(
+                    q=q[group],
+                    k=k[group],
+                    v=v[group],
+                    g=g[group],
+                    level_scales=level_scales[group],
+                    output=output[group],
+                )
+            return output
+    return _chunk_forward(q=q, k=k, v=v, g=g, level_scales=level_scales)
+
+
+def _batch_group_size(v: torch.Tensor, g: torch.Tensor, key_dim: int) -> int:
+    batch, sequence, heads, value_dim = v.shape
+    chunks = sequence // CHUNK_SIZE
+    key_tiles = key_dim // BLOCK_KEY
+    output_bytes = v.nbytes // batch
+    partial_bytes = output_bytes * key_tiles
+    state_bytes = (chunks - 1) * heads * key_dim * value_dim * v.element_size()
+    gate_bytes = (sequence + chunks) * heads * g.element_size()
+    score_bytes = chunks * key_tiles * CHUNK_SIZE**2 * g.element_size()
+    factor_bytes = (chunks.bit_length() - 1) * (g.nbytes // batch) // 2
+    workspace_per_batch = partial_bytes + max(state_bytes, output_bytes) + gate_bytes + score_bytes + factor_bytes
+    free_bytes, _ = torch.cuda.mem_get_info(v.device)
+    required_bytes = batch * workspace_per_batch
+    if required_bytes <= free_bytes:
+        return batch
+    stats = torch.cuda.memory_stats(v.device)
+    available_bytes = free_bytes + stats["reserved_bytes.all.current"] - stats["allocated_bytes.all.current"]
+    if required_bytes <= available_bytes:
+        return batch
+    compute_units = torch.cuda.get_device_properties(v.device).multi_processor_count
+    batches_per_wave = triton.cdiv(compute_units, chunks * key_tiles)
+    return max(1, min(batches_per_wave, (free_bytes - v.nbytes) // workspace_per_batch))
+
+
+def _chunk_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    level_scales: torch.Tensor,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    batch, sequence, heads, value_dim = v.shape
+    key_dim = q.shape[-1]
+    levels = level_scales.shape[-1]
     num_chunks = sequence // CHUNK_SIZE
     cache_states = num_chunks > 1
     num_levels = max(1, num_chunks.bit_length() - 1)
@@ -249,10 +302,14 @@ def chunk_log_linear_attn(
         )
     else:
         scores = query_factors = None
+    key_tiles_per_program = 2 if share_value_tiles and num_key_tiles == 2 else 1
+    output_key_tiles = num_key_tiles // key_tiles_per_program
     if fuse_forward:
-        output_partial = torch.empty((batch, sequence, heads, num_key_tiles, value_dim), device=v.device, dtype=v.dtype)
+        output_partial = torch.empty(
+            (batch, sequence, heads, output_key_tiles, value_dim), device=v.device, dtype=v.dtype
+        )
         if share_value_tiles:
-            _shared_score_output_kernel[shared_grid_size,](
+            _shared_score_output_kernel[shared_grid_size // key_tiles_per_program,](
                 q=q,
                 k=k,
                 v=v,
@@ -277,6 +334,7 @@ def chunk_log_linear_attn(
                 BV=BLOCK_VALUE,
                 NK=num_key_tiles,
                 NV=num_value_tiles,
+                KEY_TILES_PER_PROGRAM=key_tiles_per_program,
                 num_warps=4,
                 num_stages=2,
             )
@@ -333,9 +391,10 @@ def chunk_log_linear_attn(
             num_stages=2,
         )
     del cached_states, scores, query_factors
-    if num_key_tiles == 1:
+    if output_key_tiles == 1:
         return output_partial.squeeze(3)
-    output = torch.empty_like(v)
+    if output is None:
+        output = torch.empty_like(v)
     _reduce_output_flat_kernel[triton.cdiv(batch * sequence * heads * value_dim, REDUCTION_BLOCK),](
         partial=output_partial,
         output=output,

@@ -680,62 +680,79 @@ def _shared_score_output_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
+    KEY_TILES_PER_PROGRAM: tl.constexpr,
 ):
+    OUTPUT_KEY_TILES: tl.constexpr = NK // KEY_TILES_PER_PROGRAM
     index = tl.program_id(0).to(tl.int64)
-    key_tile = (index % NK).to(tl.int32)
-    head = (index // NK) % H
-    chunk = (index // (NK * H)) % NT
-    batch = index // (NK * H * NT)
+    output_key_tile = (index % OUTPUT_KEY_TILES).to(tl.int32)
+    head = (index // OUTPUT_KEY_TILES) % H
+    chunk = (index // (OUTPUT_KEY_TILES * H)) % NT
+    batch = index // (OUTPUT_KEY_TILES * H * NT)
     rows = tl.arange(0, BLOCK_T)
     cols = tl.arange(0, BLOCK_T)
     tokens = chunk * BLOCK_T + rows
-    keys = key_tile * BK + tl.arange(0, BK)
-    query = tl.load(q + (batch * T + tokens[:, None]) * K + keys[None, :]).to(tl.float32)
     gates = tl.load(g + (batch * T + tokens) * H + head)
     tile_offsets = rows[:, None] * BLOCK_T + cols[None, :]
     levels = tl.load(level_lut + tile_offsets)
     scales = tl.load(level_scales + ((batch * T + tokens[:, None]) * H + head) * L + levels).to(tl.float32)
     factors = tl.exp(gates[:, None] - gates[None, :]) * scales
-    if scores is None:
-        key = tl.load(k + (batch * T + tokens[:, None]) * K + keys[None, :])
-        score = tl.dot(query.to(q.dtype.element_ty), tl.trans(key))
-    else:
-        score_base = ((batch * NT + chunk) * NK + key_tile) * BLOCK_T * BLOCK_T
-        score = tl.load(scores + score_base + tile_offsets)
-    weighted = tl.where(rows[:, None] >= cols[None, :], score * factors, 0.0).to(v.dtype.element_ty)
-    accumulators = ()
+    totals = ()
     for value_tile in tl.static_range(NV):
-        columns = value_tile * BV + tl.arange(0, BV)
-        values = tl.load(v + ((batch * T + tokens[:, None]) * H + head) * V + columns[None, :])
-        partial = tl.dot(weighted, values).to(v.dtype.element_ty).to(tl.float32)
-        accumulators += (partial,)
-    end = chunk - 1
-    later_decay = tl.zeros([], tl.float32)
-    for level in tl.static_range(NUM_LEVELS):
-        if chunk & (1 << level) != 0:
-            if query_factors is None:
-                scale = tl.load(level_scales + ((batch * T + tokens) * H + head) * L + 7 + level).to(tl.float32)
-                query_factor = scale * tl.exp(gates + later_decay)
-            else:
-                base = _query_factor_base(
-                    batch=batch, chunk=chunk, head=head, LEVEL=level, H=H, NT=NT, NUM_LEVELS=NUM_LEVELS
-                )
-                query_factor = tl.load(query_factors + base + rows)
-            scaled = (query * query_factor[:, None]).to(q.dtype.element_ty)
-            state_base = _cached_state_base(batch=batch, head=head, end=end, LEVEL=level, B=B, H=H, K=K, V=V, NT=NT)
-            updated = ()
+        totals += (tl.zeros((BLOCK_T, BV), tl.float32),)
+    for key_offset in tl.static_range(KEY_TILES_PER_PROGRAM):
+        key_tile = output_key_tile * KEY_TILES_PER_PROGRAM + key_offset
+        keys = key_tile * BK + tl.arange(0, BK)
+        query = tl.load(q + (batch * T + tokens[:, None]) * K + keys[None, :]).to(tl.float32)
+        if scores is None:
+            key = tl.load(k + (batch * T + tokens[:, None]) * K + keys[None, :])
+            score = tl.dot(query.to(q.dtype.element_ty), tl.trans(key))
+        else:
+            score_base = ((batch * NT + chunk) * NK + key_tile) * BLOCK_T * BLOCK_T
+            score = tl.load(scores + score_base + tile_offsets)
+        weighted = tl.where(rows[:, None] >= cols[None, :], score * factors, 0.0).to(v.dtype.element_ty)
+        accumulators = ()
+        for value_tile in tl.static_range(NV):
+            columns = value_tile * BV + tl.arange(0, BV)
+            values = tl.load(v + ((batch * T + tokens[:, None]) * H + head) * V + columns[None, :])
+            partial = tl.dot(weighted, values).to(v.dtype.element_ty).to(tl.float32)
+            accumulators += (partial,)
+        end = chunk - 1
+        later_decay = tl.zeros([], tl.float32)
+        for level in tl.static_range(NUM_LEVELS):
+            if chunk & (1 << level) != 0:
+                if query_factors is None:
+                    scale = tl.load(level_scales + ((batch * T + tokens) * H + head) * L + 7 + level).to(tl.float32)
+                    query_factor = scale * tl.exp(gates + later_decay)
+                else:
+                    base = _query_factor_base(
+                        batch=batch, chunk=chunk, head=head, LEVEL=level, H=H, NT=NT, NUM_LEVELS=NUM_LEVELS
+                    )
+                    query_factor = tl.load(query_factors + base + rows)
+                scaled = (query * query_factor[:, None]).to(q.dtype.element_ty)
+                state_base = _cached_state_base(batch=batch, head=head, end=end, LEVEL=level, B=B, H=H, K=K, V=V, NT=NT)
+                updated = ()
+                for value_tile in tl.static_range(NV):
+                    columns = value_tile * BV + tl.arange(0, BV)
+                    state = tl.load(states + state_base + keys[:, None] * V + columns[None, :])
+                    updated += (accumulators[value_tile] + tl.dot(scaled, state),)
+                accumulators = updated
+                block_size = 1 << level
+                if query_factors is None:
+                    offsets = tl.arange(0, MAX_BLOCK)
+                    gate_offsets = (batch * NT + end - block_size + 1 + offsets) * H + head
+                    later_decay += tl.sum(
+                        tl.load(chunk_gates + gate_offsets, mask=offsets < block_size, other=0.0), axis=0
+                    )
+                end -= block_size
+        if KEY_TILES_PER_PROGRAM > 1:
+            updated_totals = ()
             for value_tile in tl.static_range(NV):
-                columns = value_tile * BV + tl.arange(0, BV)
-                state = tl.load(states + state_base + keys[:, None] * V + columns[None, :])
-                updated += (accumulators[value_tile] + tl.dot(scaled, state),)
-            accumulators = updated
-            block_size = 1 << level
-            if query_factors is None:
-                offsets = tl.arange(0, MAX_BLOCK)
-                gate_offsets = (batch * NT + end - block_size + 1 + offsets) * H + head
-                later_decay += tl.sum(tl.load(chunk_gates + gate_offsets, mask=offsets < block_size, other=0.0), axis=0)
-            end -= block_size
+                partial = accumulators[value_tile].to(output.dtype.element_ty).to(tl.float32)
+                updated_totals += (totals[value_tile] + partial,)
+            totals = updated_totals
+        else:
+            totals = accumulators
     for value_tile in tl.static_range(NV):
         columns = value_tile * BV + tl.arange(0, BV)
-        dst = (((batch * T + tokens[:, None]) * H + head) * NK + key_tile) * V + columns[None, :]
-        tl.store(output + dst, accumulators[value_tile].to(output.dtype.element_ty))
+        dst = (((batch * T + tokens[:, None]) * H + head) * OUTPUT_KEY_TILES + output_key_tile) * V + columns[None, :]
+        tl.store(output + dst, totals[value_tile].to(output.dtype.element_ty))
