@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
+from typing import Any
 
 import torch
 import triton
@@ -24,6 +26,7 @@ from flag_attn.inkling_fa4.relative_attention import _validate_inputs
 from .kernels import _combine_split_kv_metax_kernel, _fa4_rel_attn_paged_kernel
 
 _DOT_TILE = 16
+_TLE_UNAVAILABLE = "TLE is unavailable on MetaX"
 
 
 @lru_cache
@@ -286,3 +289,34 @@ def inkling_fa4_rel_attention_triton(
             num_warps=combine_warps,
         )
     return out
+
+
+def inkling_fa4_rel_attention_tle(*args: Any, **kwargs: Any) -> torch.Tensor:
+    raise RuntimeError(_TLE_UNAVAILABLE)
+
+
+def tle_available() -> tuple[bool, str]:
+    return False, _TLE_UNAVAILABLE
+
+
+def _require_triton(name: str | None, tle_error: type[Exception]) -> None:
+    selected = (name or os.getenv("INKLING_FA4_BACKEND", "auto")).strip().lower()
+    if selected in ("auto", "triton", "base"):
+        return
+    if selected in ("tle", "triton_tle", "triton-tle"):
+        raise tle_error(_TLE_UNAVAILABLE)
+    raise ValueError(f"unknown Inkling FA4 backend={selected!r}; choose from auto, triton, base")
+
+
+def get_backend(name: str | None = None):
+    _require_triton(name, ImportError)
+    return inkling_fa4_rel_attention_triton
+
+
+def inkling_fa4_rel_attention(
+    *args: Any,
+    backend: str | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    _require_triton(backend, RuntimeError)
+    return inkling_fa4_rel_attention_triton(*args, **kwargs)
