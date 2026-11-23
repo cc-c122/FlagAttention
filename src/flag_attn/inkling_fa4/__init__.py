@@ -14,36 +14,27 @@
 
 """Inkling FA4 paged relative attention with Triton and optional Hopper TLE."""
 
-from flag_attn.runtime.backend import resolve_operator
+from flag_attn.runtime import device as _device
 
-_OPERATOR_EXPORTS = {
-    "get_backend": (
-        "inkling_fa4_get_backend", "flag_attn.inkling_fa4.relative_attention", "get_backend"
-    ),
-    "inkling_fa4_rel_attention": (
-        "inkling_fa4_rel_attention", "flag_attn.inkling_fa4.relative_attention", "inkling_fa4_rel_attention"
-    ),
-    "inkling_fa4_rel_attention_tle": (
-        "inkling_fa4_rel_attention_tle", "flag_attn.inkling_fa4.relative_attention", "inkling_fa4_rel_attention_tle"
-    ),
-    "inkling_fa4_rel_attention_triton": (
-        "inkling_fa4_rel_attention_triton", "flag_attn.inkling_fa4.relative_attention", "inkling_fa4_rel_attention_triton"
-    ),
-    "tle_available": (
-        "inkling_fa4_tle_available", "flag_attn.inkling_fa4.relative_attention", "tle_available"
-    ),
-}
+if _device.vendor_name == "metax":
+    from flag_attn.runtime.backend import resolve_operator as _resolve_operator
 
+    def __getattr__(name: str):
+        if name not in __all__:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        operator = f"inkling_fa4_{name}" if name in ("get_backend", "tle_available") else name
+        value = _resolve_operator(operator, "flag_attn.inkling_fa4.relative_attention", name)
+        globals()[name] = value
+        return value
 
-def __getattr__(name: str):
-    try:
-        operator, module, symbol = _OPERATOR_EXPORTS[name]
-    except KeyError as exc:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-    value = resolve_operator(operator, module, symbol)
-    globals()[name] = value
-    return value
-
+else:
+    from .relative_attention import (
+        get_backend,
+        inkling_fa4_rel_attention,
+        inkling_fa4_rel_attention_tle,
+        inkling_fa4_rel_attention_triton,
+        tle_available,
+    )
 
 __all__ = [
     "get_backend",
