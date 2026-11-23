@@ -78,9 +78,7 @@ def inkling_fa4_rel_attention_triton(
     ``[num_blocks, block_size, num_kv_heads, head_dim]``. ``block_table`` maps
     each sequence's logical KV blocks to physical cache blocks.
 
-    This is an inference-only implementation. On H100 the upstream Inkling
-    heuristic normally selects one split; larger ``num_splits`` values execute
-    real split-KV attention followed by a numerically stable FP32 combine.
+    This is an inference-only implementation.
     """
     _validate_inputs(
         q=q,
@@ -191,9 +189,6 @@ def inkling_fa4_rel_attention_triton(
         partial_out = out
         partial_max = out
         partial_sum = out
-    # A regular grid makes the task coordinate directly available through
-    # program_id. Shorter sequences launch masked programs, but the wrapper no
-    # longer needs CUDA elementwise/div/cumsum kernels to construct task_ends.
     grid = (max_q_blocks, batch_size * scheduler_heads, num_splits)
     _fa4_rel_attn_paged_kernel[grid](
         q_ptr=q,

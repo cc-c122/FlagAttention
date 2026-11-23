@@ -80,8 +80,6 @@ def _fa4_rel_attn_paged_kernel(
     SINGLE_QUERY: tl.constexpr = False,
 ):
     # The regular 3D grid directly encodes (Q block, sequence/head, split).
-    # This replaces the wrapper-side task_ends prefix sum and the per-program
-    # lower-bound search used by the previous compact scheduler.
     pid_q_grid = tl.program_id(0)
     seq_head_id = tl.program_id(1)
     split_idx = tl.program_id(2)
@@ -219,8 +217,7 @@ def _fa4_rel_attn_paged_kernel(
             logical_block = k_local // BLOCK_SIZE
             offset_in_block = k_local % BLOCK_SIZE
             # A page-aligned tile needs one page-table scalar instead of BLOCK_K
-            # identical entries. Keep the vector gather for the common 16-token
-            # page / 64-or-128-token compute tile case.
+            # identical entries.
             if BLOCK_K == BLOCK_SIZE:
                 physical_page = tl.load(
                     block_table_ptr + seq_id * stride_bt_b + block_k * stride_bt_block,
@@ -283,8 +280,6 @@ def _fa4_rel_attn_paged_kernel(
             if not split_bias_range or phase == 1:
                 scores += rel_bias.to(tl.float32)
 
-            # Hopper's approximate exp2 path is cheaper. Convert the *complete*
-            # score, including relative bias, so the operator remains unchanged.
             scores = tl.where(
                 mask,
                 scores * 1.4426950408889634,
